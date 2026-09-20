@@ -1,0 +1,21 @@
+/*
+ * SPDX-FileCopyrightText: 2025 Espressif Systems (Shanghai) CO., LTD
+ * SPDX-License-Identifier: LicenseRef-Espressif-Modified-MIT
+ *
+ * See LICENSE file for details.
+ */
+
+#pragma once
+
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif  /* __cplusplus */
+
+esp_err_t test_dev_camera(void);
+esp_err_t test_dev_camera_deinit_busy(void);
+
+#ifdef __cplusplus
+}
+#endif  /* __cplusplus */

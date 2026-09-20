@@ -1,0 +1,5 @@
+board: s31_es8389
+chip: esp32s31
+version: "1.0.0"
+description: "ESP32-S31 custom board with ES8389 (I2S STD duplex, SDMMC 4-bit)"
+manufacturer: "custom"

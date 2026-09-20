@@ -1,0 +1,334 @@
+# SPDX-FileCopyrightText: 2025 Espressif Systems (Shanghai) CO., LTD
+# SPDX-License-Identifier: LicenseRef-Espressif-Modified-MIT
+#
+# See LICENSE file for details.
+
+# Camera device config parser
+VERSION = 'v1.0.0'
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+DEV_CAMERA_IO_LIST = {
+    'dvp': [
+        'reset_io',
+        'pwdn_io',
+        'de_io',
+        'pclk_io',
+        'xclk_io',
+        'vsync_io',
+        'data_io_0',
+        'data_io_1',
+        'data_io_2',
+        'data_io_3',
+        'data_io_4',
+        'data_io_5',
+        'data_io_6',
+        'data_io_7',
+        'data_io_8',
+        'data_io_9',
+        'data_io_10',
+        'data_io_11',
+        'data_io_12',
+        'data_io_13',
+        'data_io_14',
+        'data_io_15',
+    ],
+    'csi': [
+        'reset_io',
+        'pwdn_io',
+        'xclk_pin',
+    ],
+    'spi': [
+        'spi_cs_pin',
+        'spi_sclk_pin',
+        'spi_data0_io_pin',
+        'spi_data1_io_pin',
+        'reset_pin',
+        'pwdn_pin',
+        'xclk_pin',
+    ],
+}
+
+
+def _find_peripheral(peripherals, role, device_name, peripherals_dict=None):
+    explicit = []
+    legacy = []
+    for periph in peripherals:
+        if not isinstance(periph, dict):
+            periph = {'name': periph}
+        if f'{role}_name' in periph:
+            explicit.append(periph)
+        elif periph.get('_binding_role') == role:
+            explicit.append(periph)
+        elif str(periph.get('name', '')).startswith(role):
+            legacy.append(periph)
+    if len(explicit) > 1:
+        raise ValueError(f'Camera device {device_name} references multiple {role} peripherals')
+    if explicit and legacy:
+        raise ValueError(f'Camera device {device_name} cannot mix {role}_name with legacy {role} binding')
+    if explicit:
+        selected = explicit[0]
+        periph_name = selected.get(f'{role}_name', selected.get('name'))
+        if peripherals_dict is not None:
+            if periph_name not in peripherals_dict:
+                raise ValueError(f"Camera device {device_name} references undefined peripheral '{periph_name}'")
+            if getattr(peripherals_dict[periph_name], 'type', None) != role:
+                raise ValueError(f'Camera device {device_name} {role} peripheral must have type {role}')
+        selected = dict(selected)
+        selected['name'] = periph_name
+        return selected
+    if len(legacy) > 1:
+        raise ValueError(f'Camera device {device_name} references multiple legacy {role} peripherals')
+    if legacy:
+        logger.warning('Camera device %s uses legacy %s peripheral inference; migrate to %s_name.', device_name, role, role)
+        return legacy[0]
+    return None
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from generators.utils.idf_enum import resolve_idf_macro
+
+KNOWN_CAM_DATA_WIDTH = frozenset((
+    'CAM_CTLR_DATA_WIDTH_8',
+    'CAM_CTLR_DATA_WIDTH_10',
+    'CAM_CTLR_DATA_WIDTH_12',
+    'CAM_CTLR_DATA_WIDTH_16',
+))
+KNOWN_CAM_SPI_INTF = frozenset((
+    'ESP_CAM_CTLR_SPI_CAM_INTF_SPI',
+    'ESP_CAM_CTLR_SPI_CAM_INTF_PARLIO',
+))
+KNOWN_CAM_SPI_IO_MODE = frozenset((
+    'ESP_CAM_CTLR_SPI_CAM_IO_MODE_1BIT',
+    'ESP_CAM_CTLR_SPI_CAM_IO_MODE_2BIT',
+))
+
+VALID_ENUMS = {
+    'data_width': ( ('CAM_CTLR_DATA_WIDTH_',), KNOWN_CAM_DATA_WIDTH ),
+    'spi_cam_intf': ( ('ESP_CAM_CTLR_SPI_CAM_INTF_',), KNOWN_CAM_SPI_INTF ),
+    'spi_cam_io_mode': ( ('ESP_CAM_CTLR_SPI_CAM_IO_MODE_',), KNOWN_CAM_SPI_IO_MODE ),
+}
+
+def get_includes() -> list:
+    """Return list of required include headers for camera device"""
+    return [
+        'dev_camera.h'
+    ]
+
+def get_enum_value(value: str, full_enum: str, enum_type: str = None) -> str:
+    """Resolve a YAML camera enumerator, passing through unknown prefixed macros."""
+    if not enum_type:
+        return value if value else full_enum
+    spec = VALID_ENUMS.get(enum_type)
+    if spec is None:
+        print(f"⚠️  WARNING: Unknown enum type '{enum_type}' for validation")
+        return value if value else full_enum
+    prefixes, known = spec
+    return resolve_idf_macro(value, full_enum, prefixes, known, enum_type)
+
+def parse(name: str, config: dict, peripherals_dict=None) -> dict:
+    """Parse camera device configuration from YAML to C structure"""
+
+    # Parse the device name - use name directly for C naming
+    c_name = name.replace('-', '_')  # Convert hyphens to underscores for C naming
+
+    # Get the device config
+    device_config = config.get('config', {})
+
+    sub_type = config.get('sub_type')
+    if sub_type is None:
+        bus_type = device_config.get('bus_type')
+        if bus_type is not None:
+            raise ValueError(f"Please use 'sub_type' to distinguish camera sensor type in the 'board_devices.yaml', refer to 'dev_camera.yaml'")
+        else:
+            raise ValueError(f"YAML validation error in camera device: Missing 'sub_type' field")
+
+    # Initialize bus config
+    bus_config = None
+    # Parse configuration based on bus type
+    if sub_type == 'dvp':
+        # Process peripherals to find I2C master
+        i2c_name = ''
+        i2c_freq = 0
+        peripherals = config.get('peripherals', [])
+        periph = _find_peripheral(peripherals, 'i2c', name, peripherals_dict)
+        if periph:
+            i2c_name = periph['name']
+            i2c_freq = int(periph.get('frequency', 100000))
+
+        if not i2c_name:
+            raise ValueError(f"Camera device {name} (dvp) requires an i2c peripheral in 'peripherals'")
+
+        dvp_config_dict = device_config.get('dvp_config', {})
+
+        # Parse DVP IO and settings
+        reset_io = int(dvp_config_dict.get('reset_io', -1))
+        pwdn_io = int(dvp_config_dict.get('pwdn_io', -1))
+        de_io = int(dvp_config_dict.get('de_io', -1))
+        pclk_io = int(dvp_config_dict.get('pclk_io', -1))
+        xclk_io = int(dvp_config_dict.get('xclk_io', -1))
+        vsync_io = int(dvp_config_dict.get('vsync_io', -1))
+        xclk_freq = int(dvp_config_dict.get('xclk_freq', 10000000))
+        data_width = dvp_config_dict.get('data_width', 'CAM_CTLR_DATA_WIDTH_8')
+        data_width_enum = get_enum_value(data_width, 'CAM_CTLR_DATA_WIDTH_8', 'data_width')
+
+        # Parse DVP data io configuration
+        data_io_config = dvp_config_dict.get('data_io', {})
+
+        # Build data_io array from data_io_0 to data_io_15
+        data_io_array = []
+        for i in range(16):
+            io_key = f'data_io_{i}'
+            io_value = int(data_io_config.get(io_key, -1))
+            data_io_array.append(io_value)
+
+        # Build dvp_io structure
+        dvp_io = {
+            'data_width': data_width_enum,
+            'data_io': data_io_array,
+            'vsync_io': vsync_io,
+            'de_io': de_io,
+            'pclk_io': pclk_io,
+            'xclk_io': xclk_io
+        }
+
+        # Build full DVP config
+        bus_config = {
+            'i2c_name': i2c_name,
+            'i2c_freq': i2c_freq,
+            'reset_io': reset_io,
+            'pwdn_io': pwdn_io,
+            'dvp_io': dvp_io,
+            'xclk_freq': xclk_freq
+        }
+
+    # CSI configuration parsing
+    elif sub_type == 'csi':
+        # Process peripherals to find I2C master and LDO
+        i2c_name = ''
+        i2c_freq = 0
+        ldo_name = ''
+        csi_config_dict = device_config.get('csi_config', {})
+        dont_init_ldo = bool(csi_config_dict.get('dont_init_ldo', True))
+        peripherals = config.get('peripherals', [])
+        periph = _find_peripheral(peripherals, 'i2c', name, peripherals_dict)
+        if periph:
+            i2c_name = periph['name']
+            i2c_freq = int(periph.get('frequency', 100000))
+        periph = _find_peripheral(peripherals, 'ldo', name, peripherals_dict)
+        if periph:
+            ldo_name = periph['name']
+
+        if not i2c_name:
+            raise ValueError(f"Camera device {name} (csi) requires an i2c peripheral in 'peripherals'")
+        if dont_init_ldo and not ldo_name:
+            raise ValueError(
+                f'Camera device {name} (csi) requires an ldo peripheral when dont_init_ldo is true'
+            )
+
+        # Parse CSI settings
+        reset_io = int(csi_config_dict.get('reset_io', -1))
+        pwdn_io = int(csi_config_dict.get('pwdn_io', -1))
+
+        # Parse XCLK configuration
+        xclk_config_dict = csi_config_dict.get('xclk_config', {})
+        xclk_pin = int(xclk_config_dict.get('xclk_pin', -1))
+        xclk_freq_hz = int(xclk_config_dict.get('xclk_freq_hz', 20000000))
+        if xclk_pin == -1 and 'esp_clock_router_cfg' in xclk_config_dict:
+            xclk_config_dict = xclk_config_dict.get('esp_clock_router_cfg', {})
+            xclk_pin = int(xclk_config_dict.get('xclk_pin', -1))
+            xclk_freq_hz = int(xclk_config_dict.get('xclk_freq_hz', 20000000))
+        xclk_config_struct = {}
+        if xclk_pin != -1:
+             # If user defined simple xclk_pin/freq, wrap it in esp_clock_router_cfg for C struct
+             xclk_config_struct = {
+                 'esp_clock_router_cfg': {
+                     'xclk_pin': xclk_pin,
+                     'xclk_freq_hz': xclk_freq_hz
+                 }
+             }
+
+        # Build CSI config
+        bus_config = {
+            'i2c_name': i2c_name,
+            'i2c_freq': i2c_freq,
+            'ldo_name': ldo_name,
+            'reset_io': reset_io,
+            'pwdn_io': pwdn_io,
+            'dont_init_ldo': dont_init_ldo,
+            'xclk_config': xclk_config_struct
+        }
+
+    elif sub_type == 'spi':
+        i2c_name = ''
+        i2c_freq = 0
+        peripherals = config.get('peripherals', [])
+        periph = _find_peripheral(peripherals, 'i2c', name, peripherals_dict)
+        if periph:
+            i2c_name = periph['name']
+            i2c_freq = int(periph.get('frequency', 100000))
+
+        if not i2c_name:
+            raise ValueError(f"Camera device {name} (spi) requires an i2c peripheral in 'peripherals'")
+
+        sc = device_config.get('spi_config', {})
+        intf = get_enum_value(sc.get('intf'), 'ESP_CAM_CTLR_SPI_CAM_INTF_SPI', 'spi_cam_intf')
+        # io_mode / spi_data1_io_pin: newer esp_video (esp_video_init.h) has these fields; older 1.4.x
+        # layout does not — emitting them breaks static init alignment vs released components.
+        # Defaults are applied in dev_camera_sub_spi.c (1-bit, data1 NC) when the struct includes them.
+
+        esp_video_spi = {
+            'intf': intf,
+            'spi_port': int(sc.get('spi_port', 0)),
+            'spi_cs_pin': int(sc.get('spi_cs_pin', -1)),
+            'spi_sclk_pin': int(sc.get('spi_sclk_pin', -1)),
+            'spi_data0_io_pin': int(sc.get('spi_data0_io_pin', -1)),
+            'reset_pin': int(sc.get('reset_pin', -1)),
+            'pwdn_pin': int(sc.get('pwdn_pin', -1)),
+            'xclk_source': sc.get('xclk_source', 'ESP_CAM_SENSOR_XCLK_LEDC'),
+            'xclk_freq': int(sc.get('xclk_freq', 20000000)),
+            'xclk_pin': int(sc.get('xclk_pin', -1)),
+        }
+        # Optional: only for esp_video whose esp_video_init_spi_config_t includes these members
+        # (see esp_video_init.h). Omitted by default for compatibility with esp_video 1.4.x.
+        if sc.get('io_mode') is not None and sc.get('io_mode') != '':
+            esp_video_spi['io_mode'] = get_enum_value(sc.get('io_mode'), 'ESP_CAM_CTLR_SPI_CAM_IO_MODE_1BIT', 'spi_cam_io_mode')
+        if sc.get('spi_data1_io_pin') is not None:
+            esp_video_spi['spi_data1_io_pin'] = int(sc.get('spi_data1_io_pin'))
+        ledc = sc.get('xclk_ledc_cfg')
+        if ledc:
+            esp_video_spi['xclk_ledc_cfg'] = {
+                'timer': ledc.get('timer', 0),
+                'clk_cfg': ledc.get('clk_cfg', 'LEDC_AUTO_CLK'),
+                'channel': ledc.get('channel', 0),
+            }
+        bus_config = {
+            'i2c_name': i2c_name,
+            'i2c_freq': i2c_freq,
+            'esp_video_spi': esp_video_spi,
+        }
+    elif sub_type == 'usb_uvc':
+        # USB-UVC configuration parsing would go here
+        bus_config = {}  # Placeholder
+    else:
+        raise ValueError(f"Unsupported sub_type '{sub_type}' for camera device {name}")
+
+    # Create the base result structure
+    result = {
+        'struct_type': 'dev_camera_config_t',
+        'struct_var': f'{c_name}_cfg',
+        'struct_init': {
+            'name': c_name,
+            'type': str(config.get('type', 'camera')),
+            'sub_type': sub_type,
+            'sub_cfg' : {}
+        }
+    }
+
+    # Add the bus-specific configuration
+    result['struct_init']['sub_cfg'][sub_type] = bus_config
+    return result

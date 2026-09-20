@@ -1,0 +1,5 @@
+dependencies:
+  espressif/esp_board_manager: {}
+  espressif/esp_boards: {}
+  espressif/esp_lcd_touch: ^1.1.2
+  espressif/esp_lvgl_adapter: '*'

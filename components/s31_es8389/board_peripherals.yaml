@@ -1,0 +1,68 @@
+# Peripherals for this ESP32-S31 + ES8389 board.
+# Pins match the working es8389-i2s_sdmmc_music example:
+#   I2C  SDA=GPIO0  SCL=GPIO1
+#   I2S0 BCK=GPIO49 WS=GPIO50 DOUT=GPIO51 DIN=GPIO52 MCLK=NC
+#   PA   GPIO47
+#   SD   power GPIO60 (active low)
+
+peripherals:
+  - name: i2c_master
+    type: i2c
+    role: master
+    config:
+      port: 0
+      pins:
+        sda: 0
+        scl: 1
+
+  # I2S0 full-duplex: same clocks, DOUT for DAC and DIN for ADC.
+  - name: i2s_audio_out
+    type: i2s
+    role: master
+    format: std-out
+    config: &i2s_audio_config
+      port: 0
+      sample_rate_hz: 48000
+      mclk_multiple: 256
+      data_bit_width: 16
+      slot_bit_width: I2S_SLOT_BIT_WIDTH_AUTO
+      slot_mode: I2S_SLOT_MODE_STEREO
+      slot_mask: I2S_STD_SLOT_BOTH
+      ws_width: 16
+      pins:
+        mclk: -1
+        bclk: 49
+        ws: 50
+        dout: 51
+        din: 52
+
+  - name: i2s_audio_in
+    type: i2s
+    role: master
+    format: std-in
+    config: *i2s_audio_config
+
+  - name: gpio_pa_control
+    type: gpio
+    role: io
+    config:
+      pin: 47
+      mode: GPIO_MODE_OUTPUT
+      default_level: 0
+
+  - name: gpio_sd_power
+    type: gpio
+    role: io
+    config:
+      pin: 60
+      mode: GPIO_MODE_OUTPUT
+      default_level: 1
+
+  # ST7262 backlight. Matches the working MP4 player (GPIO39, high = on).
+  - name: gpio_lcd_bl
+    type: gpio
+    role: io
+    config:
+      pin: 39
+      mode: GPIO_MODE_OUTPUT
+      default_level: 0

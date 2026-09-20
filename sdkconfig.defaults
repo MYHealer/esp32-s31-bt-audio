@@ -1,0 +1,64 @@
+#
+# Bootloader config
+#
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+
+#
+# Serial flasher config
+#
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHFREQ="80m"
+
+CONFIG_IDF_TARGET="esp32s31"
+CONFIG_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_EXAMPLE_BT_UI_ENABLE=y
+CONFIG_GMF_EXAMPLE_BT_DEVICE_NAME="S31-BT-AUDIO"
+CONFIG_CODEC_ES8389_SUPPORT=y
+# IDF 6.2 + GCC 16 treats Bluedroid strncpy as error; allow upgrade until Espressif fixes it.
+CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS=y
+
+#
+# Partition Table
+#
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0xA000
+# end of Partition Table
+
+#
+# FreeRTOS
+#
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
+# end of Kernel
+
+CONFIG_ESP_BT_AUDIO_GMF_IO_SUPPORT=y
+
+CONFIG_SPIRAM=y
+
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+#
+# A2DP Multi-Codec decoders (ported from ESP32-S31-A2DP-Codecs fork)
+#
+CONFIG_BT_A2DP_APTX_DECODER=y
+CONFIG_BT_A2DP_LDAC_DECODER=y
+CONFIG_BT_A2DP_OPUS_DECODER=y
+CONFIG_BT_A2DP_LC3PLUS_DECODER=y
+CONFIG_BT_A2DP_LHDCV5_DECODER=y
+CONFIG_BT_A2DP_AAC_DECODER=y
+
+#
+# Decode location: in-stack (=n). The fork's stack ships SBC/AAC decoders, so
+# this gives a working SBC/AAC sink with no application-side decoder.
+# The =y (external codec) path is what LDAC/aptX/LHDC/LC3plus needs, but its BTC
+# layer is incomplete upstream: btc_a2dp_source.c compiles to nothing under
+# BTC_AV_EXT_CODEC==TRUE while the API layer still references its symbols, so the
+# link fails with 5 undefined refs (btc_av_audio_buff_alloc/free,
+# btc_av_is_started, btc_a2d_src_audio_mtu_check, btc_a2d_src_audio_data_send).
+# Revisit once those are implemented, when adding the vendor codecs.
+CONFIG_BT_A2DP_USE_EXTERNAL_CODEC=y

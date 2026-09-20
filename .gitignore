@@ -1,0 +1,12 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+components/gen_bmgr_codes/
+.cache/
+*.bin
+*.elf
+*.map
+参考项目/
+*.log

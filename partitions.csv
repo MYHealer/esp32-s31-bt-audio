@@ -1,0 +1,8 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Note: if you change the phy_init or app partition offset, make sure to change the offset in Kconfig.projbuild
+nvs,      data, nvs,     0xB000,  0x4000,
+phy_init, data, phy,     0xf000,  0x1000,
+# The multi-codec build (BlueDroid classic + LVGL + GMF + all vendor decoders)
+# links to ~5.4 MB, which does not fit the original 3 MB slot. Flash is 16 MB
+# and everything after 0x10000 is free, so give the app 8 MB.
+factory,  app,  factory, 0x10000, 0x800000,

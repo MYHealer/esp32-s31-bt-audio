@@ -1,0 +1,34 @@
+dependencies:
+  espressif/esp_audio_codec:
+    require: public
+    version: ~2.5
+  espressif/gmf_core:
+    matches:
+    - if: $CONFIG{ESP_BT_AUDIO_GMF_IO_SUPPORT} == True
+    require: public
+    version: ~1.0
+  espressif/gmf_io:
+    matches:
+    - if: $CONFIG{ESP_BT_AUDIO_GMF_IO_SUPPORT} == True
+    require: public
+    version: ~1.0
+  idf: '>=5.5'
+description: Espressif Bluetooth Audio Module for Classic and LE Audio
+documentation: https://github.com/espressif/esp-gmf/blob/main/packages/esp_bt_audio/README.md
+issues: https://github.com/espressif/esp-gmf/issues
+repository: git://github.com/espressif/esp-gmf.git
+repository_info:
+  commit_sha: 0dddc0082c58eac6ccb15a7620bd3d7a5a537237
+  path: ./packages/esp_bt_audio
+tags:
+- Bluetooth
+- Classic
+- GMF
+- A2DP
+- HFP
+- AVRC
+- PBAC
+- LEAudio
+- Auracast
+url: https://github.com/espressif/esp-gmf/tree/main/packages/esp_bt_audio
+version: 1.1.0~1

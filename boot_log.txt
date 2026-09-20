@@ -1,0 +1,16 @@
+ESP-ROM:esp32s31-20251218
+Build:Dec 18 2025
+rst:0x1 (POWERON),boot:0x58 (SPI_FAST_FLASH_BOOT)
+SPI mode:DIO, clock div:1
+load:0x2f0740c0,len:0x1720
+load:0x2f06a2b0,len:0xc04
+load:0x2f06cfb0,len:0x32e4
+entry 0x2f06a2ba
+ESP-ROM:esp32s31-20251218
+Build:Dec 18 2025
+rst:0x1 (POWERON),boot:0x58 (SPI_FAST_FLASH_BOOT)
+SPI mode:DIO, clock div:1
+load:0x2f0740c0,len:0x1720
+load:0x2f06a2b0,len:0xc04
+load:0x2f06cfb0,len:0x32e4
+entry 0x2f06a2ba

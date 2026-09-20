@@ -1,0 +1,64 @@
+dependencies:
+  espressif/button:
+    matches:
+    - if: $CONFIG{ESP_BOARD_DEV_BUTTON_SUPPORT} == True
+    require: public
+    version: ^4.1.4
+  espressif/esp_boards:
+    version: ~0.6.0
+  espressif/esp_codec_dev:
+    matches:
+    - if: $CONFIG{ESP_BOARD_DEV_AUDIO_CODEC_SUPPORT} == True
+    require: public
+    version: ^2.0.0-beta1
+  espressif/esp_io_expander:
+    matches:
+    - if: $CONFIG{ESP_BOARD_DEV_GPIO_EXPANDER_SUPPORT} == True
+    require: public
+    version: ^1.0.1
+  espressif/esp_lcd_panel_io_additions:
+    matches:
+    - if: $CONFIG{ESP_BOARD_DEV_DISPLAY_LCD_SUB_RGB_3WIRE_SPI_SUPPORT} == True
+    require: public
+    version: ^1.0.0
+  espressif/esp_lcd_touch:
+    matches:
+    - if: $CONFIG{ESP_BOARD_DEV_LCD_TOUCH_SUPPORT} == True
+    require: public
+    version: '*'
+  espressif/esp_video:
+    matches:
+    - if: $CONFIG{ESP_BOARD_DEV_CAMERA_SUPPORT} == True
+    require: public
+    version: ^2.3.0
+  espressif/knob:
+    matches:
+    - if: $CONFIG{ESP_BOARD_DEV_KNOB_SUPPORT} == True
+    require: public
+    version: ^1.1.0
+  espressif/led_strip:
+    matches:
+    - if: $CONFIG{ESP_BOARD_DEV_LED_STRIP_SUPPORT} == True
+    require: public
+    version: '*'
+  joltwallet/littlefs:
+    matches:
+    - if: $CONFIG{ESP_BOARD_DEV_LITTLEFS_SUPPORT} == True
+    require: public
+    version: ^1.22.1
+description: Board manager for Espressif
+documentation: https://github.com/espressif/esp-board-manager/blob/main/esp_board_manager/README.md
+issues: https://github.com/espressif/esp-board-manager/issues
+repository: git://github.com/espressif/esp-board-manager.git
+repository_info:
+  commit_sha: a00b85b22c28831693529a6af01a1f842529ae3b
+  path: ./esp_board_manager
+tags:
+- board_manager
+- esp_board_manager
+- board
+- boards
+- adf
+- gmf
+url: https://github.com/espressif/esp-board-manager
+version: 0.7.3~1
