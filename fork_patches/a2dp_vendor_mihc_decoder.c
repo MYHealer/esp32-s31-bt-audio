@@ -5,11 +5,13 @@
  * provides only the audio path, and it is built on the LHDC V5 decoder engine
  * (external/lhdc-v5/) rather than a separate algorithm library.
  *
- * WARNING - the reuse is KNOWN TO BE INCORRECT, and this decoder is currently
- * unreachable in practice because A2DP_VendorBuildCodecConfigMihc() declines
- * MIHC at SET_CONFIGURATION time. The BES firmware's own MIHC decoder (MIHC1
- * 1.2.1 / MIHC2 2.1.3, core symbol mlac_dec_init) differs from LHDC V5 in ways
- * the LHDC engine cannot absorb:
+ * WARNING - the reuse is KNOWN TO BE INCORRECT. Negotiation itself works
+ * (2026-09-22: the phone selects MIHC and streams real frames - see
+ * A2DP_VendorBuildCodecConfigMihc, which now allows negotiation so that
+ * MIHC_FRAMEDUMP can capture over-the-air payloads), but playback is still
+ * noise because the BES firmware's own MIHC decoder (MIHC1 1.2.1 / MIHC2
+ * 2.1.3, core symbol mlac_dec_init) differs from LHDC V5 in ways the LHDC
+ * engine cannot absorb:
  *
  *   - MIHC frames carry a sync word and a container header, parsed by
  *     parse_header() / mihc_check_header_info(); LHDC V5 has neither and slices

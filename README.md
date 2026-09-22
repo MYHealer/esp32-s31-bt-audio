@@ -83,9 +83,13 @@ ES8389 DAC → Speaker (PA GPIO47)
 
 - 24bit I2S 输出有噪声（ES8389 MCLK 公式不匹配），当前使用 16bit
 - LDAC 采样率动态切换时 ASRC 需要重配（当前通过 stream 重建处理）
-- **MIHC 只能协商，无法出声**：S31 侧无 MLAC 解码器（BES 闭源），
-  协商成功后音频路径回落到 LHDC 引擎，MIHC 帧会输出噪声。
-  当前价值在于 bring-up（可抓取 MIHC 原始帧），非播放。
+- **MIHC 目前只能协商，不能出声**：协商已打通（手机可选中并开始推流），
+  但 S31 侧的解码器是 LHDC V5 引擎的克隆，无法还原 MIHC 的容器封装，
+  输出为噪声。待办是补上 MIHC 适配层：sync/container header 解析、CRC 层、
+  运行时 `blocksize`、自适应声道模��。
+  注意：MLAC 私有实现在 BES 固件里已被链接器 GC（移植无用），
+  真正的路径是「项目自带的 LHDC 引擎 + 待补的 MIHC 适配层」。
+  `MIHC_FRAMEDUMP` 已默认开启，用于抓取真实 over-the-air 帧。
 - 手机端需 `adb shell setprop persist.bluetooth.disable.mihc false`
   并**删除旧配对记录**（蓝牙 SDP 缓存会复用旧的 capability），
   MIHC 才会出现在开发者选项的编解码器列表中。
