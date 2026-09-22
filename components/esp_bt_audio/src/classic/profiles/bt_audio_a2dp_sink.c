@@ -404,6 +404,15 @@ static inline esp_err_t a2dp_sink_register_lc3plus_sep(uint8_t seid)
     return a2dp_sink_register_vendor_sep(seid, 0x000008A9, 0x0001);
 }
 
+/* MIHC: Xiaomi vendor_id=0x038F, codec_id=0x4D31 ("M1").
+ * Recovered from the official Redmi Buds 8 Pro firmware (1.2.3.6) codec
+ * descriptor table; the same table reproduces the public LHDC V5 (0x053A /
+ * 0x4C35) and LDAC (0x012D / 0x00AA) pairs, which validates the format. */
+static inline esp_err_t a2dp_sink_register_mihc_sep(uint8_t seid)
+{
+    return a2dp_sink_register_vendor_sep(seid, 0x0000038F, 0x4D31);
+}
+
 static bool a2dp_sink_prepare_stream_codec_cfg(bt_audio_classic_stream_t *stream)
 {
     uint32_t cfg_size = 0;
@@ -462,29 +471,66 @@ static void a2dp_sink_handle_audio_cfg(esp_a2d_mcc_t *mcc)
             break;
 #endif  /* CONFIG_BT_A2DP_CODEC_AAC_ENABLED */
         case ESP_A2D_MCT_NON_A2DP: {
-            /* Vendor codec (LDAC/LHDC/Opus): the stack-internal decoder handles
-             * decoding to PCM. Use a custom codec_type that maps to PCM
-             * pass-through in stream_proc_get_audio_type(). */
+            /* Vendor codec: the stack-internal decoder handles decoding to PCM.
+             * Use a custom codec_type that maps to PCM pass-through in
+             * stream_proc_get_audio_type(). */
             ESP_LOGI(TAG, "Vendor A2DP codec negotiated (NON_A2DP), using stack-internal decoder");
             a2dp_sink->a2d_codec.codec_type = (esp_bt_audio_stream_codec_type_t)0x20; /* ESP_AUDIO_TYPE_CUSTOMIZED */
             a2dp_sink->a2d_codec.bits = 16;
             a2dp_sink->a2d_codec.channels = 0x03; /* stereo: bit0=left, bit1=right */
 
             /* Parse negotiated sample rate from vendor CIE bytes.
-             * LDAC CIE: [vendor_id(4), codec_id(2), sample_rate(1), ch_mode(1)]
-             * LHDC CIE: similar layout with rate at same offset.
-             * The sample_rate byte uses codec-specific bitmask. */
-            uint8_t sr_byte = mcc->cie.ldac[2]; /* byte[2] = sample_rate for LDAC/LHDC */
-            if (sr_byte & 0x20) a2dp_sink->a2d_codec.sample_rate = 44100;
-            else if (sr_byte & 0x10) a2dp_sink->a2d_codec.sample_rate = 48000;
-            else if (sr_byte & 0x08) a2dp_sink->a2d_codec.sample_rate = 88200;
-            else if (sr_byte & 0x04) a2dp_sink->a2d_codec.sample_rate = 96000;
-            else if (sr_byte & 0x02) a2dp_sink->a2d_codec.sample_rate = 176400;
-            else if (sr_byte & 0x01) a2dp_sink->a2d_codec.sample_rate = 192000;
-            else a2dp_sink->a2d_codec.sample_rate = 48000; /* fallback */
+             *
+             * The cie union holds the codec-specific portion of the A2DP codec
+             * info, i.e. everything AFTER the 3-byte header
+             * [losc][media_type<<4|ver][codec_type] and the 6-byte
+             * vendor_id(4)+codec_id(2). So cie[0] == cap[9] of the on-wire
+             * capability, and cie[n] == cap[n+9].
+             *
+             * MIHC's on-wire capability is 15 bytes (verified against the phone
+             * parser at libbluetooth_jni.so 0xa47f80, which hard-rejects any
+             * losc != 0x0F); its sample-rate bitmap is cap[9] -> cie.lhdcv5[6]
+             * because the lhdcv5 member is a 4-byte vendor_id + 2-byte codec_id
+             * + payload layout, matching the wire order.
+             *
+             * LDAC sample_rate bit positions (cie.ldac[0]):
+             *   0x20=44100, 0x10=48000, 0x08=88200, 0x04=96000
+             * MIHC sample_rate bit positions (cie.lhdcv5[6]):
+             *   0x04=48000, 0x08=44100, 0x10=32000, 0x20=24000, 0x40=16000
+             *   (follows A2DP SBC convention, verified from BES firmware) */
+            uint8_t sr_byte;
+            /* Detect MIHC by vendor_id in the first 4 bytes of lhdcv5 CIE */
+            uint32_t vid = (uint32_t)mcc->cie.lhdcv5[0]
+                         | ((uint32_t)mcc->cie.lhdcv5[1] << 8)
+                         | ((uint32_t)mcc->cie.lhdcv5[2] << 16)
+                         | ((uint32_t)mcc->cie.lhdcv5[3] << 24);
+            if (vid == 0x0000038F) {
+                /* MIHC: sample_rate at offset 6 (after vendor_id:4 + codec_id:2) */
+                sr_byte = mcc->cie.lhdcv5[6];
+                ESP_LOGI(TAG, "MIHC vendor detected, CIE[6]=0x%02x", sr_byte);
+                if (sr_byte & 0x04) a2dp_sink->a2d_codec.sample_rate = 48000;
+                else if (sr_byte & 0x08) a2dp_sink->a2d_codec.sample_rate = 44100;
+                else if (sr_byte & 0x10) a2dp_sink->a2d_codec.sample_rate = 32000;
+                else if (sr_byte & 0x20) a2dp_sink->a2d_codec.sample_rate = 24000;
+                else if (sr_byte & 0x40) a2dp_sink->a2d_codec.sample_rate = 16000;
+                else a2dp_sink->a2d_codec.sample_rate = 48000;
+            } else {
+                /* LDAC/LHDC/aptX/Opus: sample_rate at cie.ldac[0]
+                 * (offset 0 of codec-specific portion, after vendor_id+codec_id) */
+                sr_byte = mcc->cie.ldac[0];
+                ESP_LOGI(TAG, "Other vendor codec (vid=0x%08lx), CIE[0]=0x%02x",
+                         (unsigned long)vid, sr_byte);
+                if (sr_byte & 0x20) a2dp_sink->a2d_codec.sample_rate = 44100;
+                else if (sr_byte & 0x10) a2dp_sink->a2d_codec.sample_rate = 48000;
+                else if (sr_byte & 0x08) a2dp_sink->a2d_codec.sample_rate = 88200;
+                else if (sr_byte & 0x04) a2dp_sink->a2d_codec.sample_rate = 96000;
+                else if (sr_byte & 0x02) a2dp_sink->a2d_codec.sample_rate = 176400;
+                else if (sr_byte & 0x01) a2dp_sink->a2d_codec.sample_rate = 192000;
+                else a2dp_sink->a2d_codec.sample_rate = 48000;
+            }
 
-            ESP_LOGI(TAG, "Vendor codec: CIE[2]=0x%02x -> sample_rate=%lu",
-                     sr_byte, (unsigned long)a2dp_sink->a2d_codec.sample_rate);
+            ESP_LOGI(TAG, "Vendor codec: sample_rate=%lu",
+                     (unsigned long)a2dp_sink->a2d_codec.sample_rate);
             break;
         }
         default:
@@ -811,6 +857,11 @@ esp_err_t bt_audio_a2dp_sink_init()
     sep_ret = a2dp_sink_register_lc3plus_sep(seid++);
     if (sep_ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to register A2DP LC3plus SEP: %s", esp_err_to_name(sep_ret));
+    }
+
+    sep_ret = a2dp_sink_register_mihc_sep(seid++);
+    if (sep_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register A2DP MIHC SEP: %s", esp_err_to_name(sep_ret));
     }
 
     ESP_LOGI(TAG, "A2DP sink: initialized with %d SEPs", seid);

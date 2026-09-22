@@ -10,3 +10,4 @@ components/gen_bmgr_codes/
 *.map
 参考项目/
 *.log
+capture_err.txt

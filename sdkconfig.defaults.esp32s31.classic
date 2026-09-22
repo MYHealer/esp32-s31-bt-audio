@@ -123,4 +123,4 @@ CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS=y
 # Do NOT lower this to 2: registration of the 3rd SEP would then return
 # ESP_ERR_INVALID_ARG, which bt_audio_a2dp_sink_init() wraps in ESP_ERROR_CHECK
 # -> abort() -> ~2s reboot loop before the UI ever comes up.
-CONFIG_BT_A2DP_SEP_NUM_MAX=9
+CONFIG_BT_A2DP_SEP_NUM_MAX=10

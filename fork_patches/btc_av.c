@@ -1912,6 +1912,13 @@ static bt_status_t btc_a2d_sink_reg_sep(UINT8 seid, const esp_a2d_mcc_t *mcc)
             BTC_TRACE_ERROR("%s: LC3plus not compiled in", __func__);
             return BT_STATUS_FAIL;
 #endif
+        } else if (vendor_id == A2DP_MIHC_VENDOR_ID && codec_id == A2DP_MIHC_CODEC_ID) {
+#if (defined(MIHC_DEC_INCLUDED) && MIHC_DEC_INCLUDED == TRUE)
+            codec_index = BTAV_A2DP_CODEC_INDEX_SINK_MIHC;
+#else
+            BTC_TRACE_ERROR("%s: MIHC not compiled in", __func__);
+            return BT_STATUS_FAIL;
+#endif
         } else {
             BTC_TRACE_ERROR("%s: unknown vendor codec 0x%08lx:0x%04x", __func__,
                             (unsigned long)vendor_id, codec_id);
