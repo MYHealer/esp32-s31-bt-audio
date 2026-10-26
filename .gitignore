@@ -32,6 +32,7 @@ __pycache__/
 
 # ---- 串口/监控/烧录脚本 ----
 *.ps1
+!apply_slot32_patch.ps1
 capture_*.py
 cap*.py
 probe_*.py

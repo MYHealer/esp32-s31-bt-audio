@@ -1,0 +1,21 @@
+--- a/espressif__esp_codec_dev/src/codec_dev_i2s_bus.c	2026-09-19 22:56:54.566280500 +0800
++++ b/espressif__esp_codec_dev/src/codec_dev_i2s_bus.c	2026-10-26 10:32:23.464799500 +0800
+@@ -234,7 +234,17 @@
+         }
+     }
+ 
+-    for (size_t i = 0; i < sizeof(s_legal_slot_bits) && !emit->stop; i++) {
++    /* MIHC/A2DP 白噪修复(方案A): 无 MCLK 的 codec(如 ES8389 use_mclk=false)内部时钟参考 BCLK,
++     * coeff 表按 64*fs 期望(48k*2*32=3.072MHz)。若 STD 候选从 16bit slot 起步, BCLK=32*fs
++     * 差 2 倍 → DAC 白噪。这里强制 STD 从 slot_bit=32 起步(64*fs 匹配), data_bit 仍随
++     * sample_info.bits_per_sample(16), I2S 硬件默认左对齐, 16bit 数据无需左移。
++     * 注意: sizeof 按字节计但元素是 uint8_t, 与 s_legal_slot_bits 元素类型一致, 迭代安全。 */
++    size_t slot_start = 0;
++    while (slot_start < sizeof(s_legal_slot_bits) && s_legal_slot_bits[slot_start] < 32) {
++        slot_start++;
++    }
++
++    for (size_t i = slot_start; i < sizeof(s_legal_slot_bits) && !emit->stop; i++) {
+         uint8_t slot_bit = s_legal_slot_bits[i];
+         // A mono request only needs half the frame, so the frame test alone can still leave a slot too
+         // narrow to hold one sample.
