@@ -14,6 +14,13 @@
 #include "freertos/queue.h"
 
 #include "esp_log.h"
+#include "esp_codec_dev.h"
+/* board_manager header not visible to this component; declare the two we need */
+typedef struct { esp_codec_dev_handle_t codec_dev; } dev_audio_codec_handles_t;
+#ifndef ESP_BOARD_DEVICE_NAME_AUDIO_DAC
+#define ESP_BOARD_DEVICE_NAME_AUDIO_DAC "audio_dac"
+#endif
+esp_err_t esp_board_manager_get_device_handle(const char *name, void **out);
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 
@@ -31,6 +38,8 @@
 extern uint32_t a2dp_ldac_current_sample_rate;
 extern uint32_t a2dp_lhdcv5_current_sample_rate;
 extern uint8_t  a2dp_lhdcv5_current_bit_depth;
+extern uint8_t  a2dp_mihc_current_bit_depth;
+extern uint32_t a2dp_mihc_current_sample_rate;
 
 #include "esp_bt_audio_defs.h"
 #include "bt_audio_classic_stream.h"
@@ -552,7 +561,26 @@ static void bt_a2d_sink_data_cb(esp_a2d_conn_hdl_t conn_hdl, esp_a2d_audio_buff_
     }
 
     esp_bt_audio_stream_packet_t msg = {0};
-    if (uxQueueSpacesAvailable(a2dp_sink->stream->base.data_q) == 0) {
+    /* --- queue-drop tap (read by `mihc_queuestat`) ---
+     * This is the ONLY link between the raw decode callback and the GMF io_bt
+     * reader that no earlier probe has observed. Everything downstream
+     * (ASRC / I2S write) already reads MUSIC_LIKE, so a periodic drop here would
+     * be indistinguishable from white noise at the speaker while every
+     * downstream tap still looks clean. ready_high records how full the queue
+     * actually gets, so "0 drops" can be distinguished from "never pressure". */
+    static volatile int32_t s_qdrop, s_qsend_fail, s_qsend_total, s_qready_high;
+    int qspaces = (int)uxQueueSpacesAvailable(a2dp_sink->stream->base.data_q);
+    {
+        extern volatile int32_t g_q_drop, g_q_sendfail, g_q_sendtotal, g_q_readyhigh;
+        if (qspaces == 0) {
+            s_qdrop++;
+            g_q_drop = s_qdrop;
+        } else if ((int)uxQueueMessagesWaiting(a2dp_sink->stream->base.data_q) > s_qready_high) {
+            s_qready_high = (int32_t)uxQueueMessagesWaiting(a2dp_sink->stream->base.data_q);
+            g_q_readyhigh = s_qready_high;
+        }
+    }
+    if (qspaces == 0) {
         if (xQueueReceive(a2dp_sink->stream->base.data_q, &msg, 0) == pdTRUE) {
             if (msg.data_owner) {
                 esp_a2d_audio_buff_free((esp_a2d_audio_buff_t *)msg.data_owner);
@@ -564,9 +592,16 @@ static void bt_a2d_sink_data_cb(esp_a2d_conn_hdl_t conn_hdl, esp_a2d_audio_buff_
     msg.data_owner = audio_buf;
     msg.bad_frame = false;
     msg.is_done = false;
-    if (xQueueSend(a2dp_sink->stream->base.data_q, &msg, 0) != pdTRUE) {
-        ESP_LOGE(TAG, "Failed to send audio buffer to queue");
-        esp_a2d_audio_buff_free(audio_buf);
+    {
+        extern volatile int32_t g_q_drop, g_q_sendfail, g_q_sendtotal, g_q_readyhigh;
+        s_qsend_total++;
+        g_q_sendtotal = s_qsend_total;
+        if (xQueueSend(a2dp_sink->stream->base.data_q, &msg, 0) != pdTRUE) {
+            s_qsend_fail++;
+            g_q_sendfail = s_qsend_fail;
+            ESP_LOGE(TAG, "Failed to send audio buffer to queue");
+            esp_a2d_audio_buff_free(audio_buf);
+        }
     }
 }
 
@@ -575,19 +610,62 @@ static void bt_a2d_sink_data_cb(esp_a2d_conn_hdl_t conn_hdl, esp_a2d_audio_buff_
  * signature, while the ext_coedc path uses bt_a2d_sink_data_cb with conn_hdl.
  * Both paths must be registered so decoded audio reaches the GMF pipeline
  * regardless of which decoder path is active. */
+/* Continuous raw-callback tap storage (read by `mihc_rawstat`) */
+volatile int32_t g_raw_cb_count, g_raw_len, g_raw_ac1_q15, g_raw_peak;
+volatile int16_t g_raw_pcm[16];
+
+/* data_q enqueue/drop tap storage (read by `mihc_queuestat`).
+ * g_q_readyhigh is the MAX depth the queue ever reached: it is what separates
+ * "no drops because delivery keeps up" from "no drops because the queue was
+ * never under pressure (i.e. something upstream is starving it)". */
+volatile int32_t g_q_drop, g_q_sendfail, g_q_sendtotal, g_q_readyhigh;
+
 static void bt_a2d_sink_raw_data_cb(const uint8_t *buf, uint32_t len)
 {
     /* Diagnostic: log every 100th call and dump first samples */
-    static uint32_t raw_cb_count = 0;
-    if (++raw_cb_count % 100 == 1) {
-        ESP_LOGI(TAG, "raw_data_cb #%lu: len=%u stream=%p", (unsigned long)raw_cb_count, (unsigned)len, (void*)a2dp_sink ? (void*)a2dp_sink->stream : NULL);
-        /* Dump first 8 samples (16 bytes) to verify PCM data quality */
-        if (buf && len >= 16) {
-            int16_t *samples = (int16_t *)buf;
-            ESP_LOGI(TAG, "PCM[0..7]: %d %d %d %d %d %d %d %d",
-                     samples[0], samples[1], samples[2], samples[3],
-                     samples[4], samples[5], samples[6], samples[7]);
+    static uint32_t raw_cb_count = 0;    raw_cb_count++;
+    /* Continuous tap: capture the FIRST 16 samples of the LAST buffer received,
+     * with no sampling, so it can be compared same-frame against the kernel tap
+     * in a2dp_vendor_mihc_decoder.c (g_mihc_emit_pcm). Read via `mihc_rawstat`. */
+    {
+        extern volatile int32_t g_raw_cb_count, g_raw_len, g_raw_ac1_q15, g_raw_peak;
+        extern volatile int16_t g_raw_pcm[16];
+        const int16_t *s = (const int16_t *)buf;
+        int n = (int)(len / 2);
+        if (n > 960) n = 960;
+        int peak = 0, zc = 0; int64_t a = 0, an = 0; int prev = 0;
+        for (int i = 0; i < n; i += 2) {
+            int v = s[i];
+            a += (int64_t)prev * v; an += (int64_t)prev * prev;
+            if ((prev < 0) != (v < 0)) zc++;
+            if (v < 0) v = -v;
+            if (v > peak) peak = v;
+            prev = s[i];
         }
+        g_raw_cb_count = (int32_t)raw_cb_count;
+        g_raw_len = (int32_t)len;        g_raw_ac1_q15 = an ? (int32_t)((a << 15) / an) : 0;
+        g_raw_peak = peak;
+        for (int i = 0; i < 16; i++) g_raw_pcm[i] = (i < n) ? s[i] : 0;
+    }
+    if ((raw_cb_count % 50) == 1 && len >= 64) {
+        const int16_t *s = (const int16_t *)buf;
+        int n = (int)(len / 2);
+        if (n > 480) n = 480;
+        long a = 0, an = 0; int prev = 0; int zc = 0; int peak = 0;
+        for (int i = 0; i < n; i += 2) {
+            int v = s[i];
+            a += (long)prev * v;
+            an += (long)prev * prev;
+            if ((prev < 0) != (v < 0)) zc++;
+            if (v < 0) v = -v;
+            if (v > peak) peak = v;
+            prev = s[i];
+        }
+        ESP_LOGI(TAG, "PCMSTAT #%u len=%u peak=%d ac1=%d zcr=%d s0=%d %d %d %d",
+                 raw_cb_count, (unsigned)len, peak,
+                 an ? (int)((a << 15) / an) : 0,
+                 (int)((zc << 15) / (n / 2 + 1)),
+                 s[0], s[1], s[2], s[3]);
     }
 
     if (!a2dp_sink || !a2dp_sink->stream) {
@@ -684,6 +762,10 @@ static void bt_a2d_event_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *p_para
                     if (a2dp_lhdcv5_current_sample_rate > 0) {
                         a2dp_sink->a2d_codec.sample_rate = a2dp_lhdcv5_current_sample_rate;
                         a2dp_sink->a2d_codec.bits = a2dp_lhdcv5_current_bit_depth;
+                    }
+                    if (a2dp_mihc_current_sample_rate > 0) {
+                        a2dp_sink->a2d_codec.sample_rate = a2dp_mihc_current_sample_rate;
+                        a2dp_sink->a2d_codec.bits = a2dp_mihc_current_bit_depth;
                     }
                     ESP_LOGI(TAG, "Vendor codec rate updated: %luHz %dbit",
                              (unsigned long)a2dp_sink->a2d_codec.sample_rate, a2dp_sink->a2d_codec.bits);

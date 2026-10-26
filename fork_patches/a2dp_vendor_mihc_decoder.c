@@ -2,41 +2,17 @@
  * MIHC (Xiaomi High-quality Codec) decoder.
  *
  * MIHC's capability/negotiation layer lives in a2dp_vendor_mihc.c. This file
- * provides only the audio path, and it is built on the LHDC V5 decoder engine
- * (external/lhdc-v5/) rather than a separate algorithm library.
+ * provides the A2DP audio path for the BT carrier.
  *
- * WARNING - the reuse is KNOWN TO BE INCORRECT. Negotiation itself works
- * (2026-09-22: the phone selects MIHC and streams real frames - see
- * A2DP_VendorBuildCodecConfigMihc, which now allows negotiation so that
- * MIHC_FRAMEDUMP can capture over-the-air payloads), but playback is still
- * noise because the BES firmware's own MIHC decoder (MIHC1 1.2.1 / MIHC2
- * 2.1.3, core symbol mlac_dec_init) differs from LHDC V5 in ways the LHDC
- * engine cannot absorb:
- *
- *   - MIHC frames carry a sync word and a container header, parsed by
- *     parse_header() / mihc_check_header_info(); LHDC V5 has neither and slices
- *     frames by a fixed length (see lhdc_dec.c).
- *   - MIHC has a CRC layer (MILL__STREAM_DECODER_ERROR_STATUS_FRAME_CRC_MISMATCH)
- *     and metadata; LHDC V5 has neither.
- *   - MIHC's decoder init takes a run-time `blocksize`; LHDC derives the frame
- *     sample count from the compile-time A2DP_LHDCV5_OUTPUT_FRAME_SAMPLES.
- *   - MIHC's channel mode is adaptive (ch_adpt_lvl / ch_type); LHDC's is fixed.
- *
- * A decoder built on the LHDC engine therefore emits noise, not PCM. This file
- * is kept because the SEP plumbing around it is correct and reusable - replace
- * the engine with a real MLAC implementation, then re-enable negotiation in
- * a2dp_vendor_mihc.c.
- *
- * This is deliberately a *clone* of a2dp_vendor_lhdcv5_decoder.c rather than a
- * shared implementation, so that a divergence discovered while bringing MIHC up
- * can be fixed here without risking LHDC regression.
- *
- * The LHDC engine is instantiated once per active codec, and only one A2DP
- * codec streams at a time, so MIHC and LHDC never hold workspace concurrently.
+ * BT carrier is Opus-shaped: each 626-byte frame is
+ *   [seq:1][71 02:2][ff fb 5a 20:4][crc8:1][L:BE16=614][TOC+EC:614][crc16:2]
+ * The payload starts at TOC 0xF4 and is decoded by mihc_celt_decode_with_ec()
+ * (modified libopus CELT — NOT MLAC/FLAC, which is the ENC-file carrier).
  */
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -44,9 +20,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "lhdc_dec.h"
-#include "lhdc_entropy_dec.h"
-#include "lhdc_imdct.h"
+#include "mihc_celt/mihc_pvq.h"
 #include "osi/allocator.h"
 #include "stack/a2dp_vendor_mihc.h"
 #include "stack/a2dp_vendor_mihc_decoder.h"
@@ -61,10 +35,9 @@
 /* Per-packet decode logging. OFF: each ESP_LOGI blocks the decode task ~9 ms on
  * the 115200-baud UART and audibly stutters playback. */
 #define MIHC_VERBOSE 0
-/* Hex-dump real over-the-air payloads. This is the primary bring-up tool for
- * MIHC: MIHC reuses the LHDC engine, so the first question when there is no
- * audio is whether the payload is framed/descrambled the same way. Dumps a
- * burst of packets once per stream, tagged MIHC_FDUMP for easy grep. */
+/* Hex-dump real over-the-air payloads. Primary bring-up tool: confirms the
+ * 626-byte BT frame layout (seq|71 02|ff fb 5a 20|crc8|L|TOC+EC|crc16) before
+ * trusting the CELT path. Dumps a burst once per stream, tagged MIHC_FDUMP. */
 #define MIHC_FRAMEDUMP 1
 static uint32_t s_dump_sr = 0;
 static uint32_t s_fd_count = 0;   /* reset per stream in configure */
@@ -77,21 +50,22 @@ static uint32_t s_fd_count = 0;   /* reset per stream in configure */
 #define MIHC_MAX_PCM_BYTES     (4 * 2000)
 
 /*
- * The decoder workspace (~39 KB at 192k) is allocated from the MAIN internal
- * heap via heap_caps_malloc(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT), NOT osi_malloc.
- * The bluedroid/osi heap fragments down to a ~15 KB largest free block during a
- * call, so osi_malloc(39 KB) fails there and the decoder would silently drop
- * every packet. Allocated ONCE at init, reused across reconfigurations, freed
- * on cleanup.
+ * MIHC CELT decoder keeps cross-frame state (OLA decode_mem / preemph /
+ * postfilter) in file-scope tables inside mihc_celt_decode.c — about 17 KB
+ * of .bss, no heap workspace. The CB only needs the fragment buffer and the
+ * I2S callback. PSRAM is still preferred for the 3 KB fragment block.
  */
+#if CONFIG_SPIRAM
+#define MIHC_WS_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#else
 #define MIHC_WS_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#endif
 typedef struct {
-    void *workspace;             /* heap block holding the decoder + rate-sized tail */
-    size_t workspace_size;       /* bytes currently allocated (rate-sized) */
-    lhdc_decoder_t *decoder;
-    int fragment_size;
-    int fragment_count;
-    uint8_t fragment[MIHC_FRAGMENT_BUF_SIZE];
+    uint8_t *workspace;              /* fragment reassembly block (3 KB) */
+    size_t   workspace_size;
+    int      fragment_size;
+    int      fragment_count;
+    uint8_t *fragment;               /* points into workspace */
     decoded_data_callback_t decode_callback;
 } tA2DP_MIHC_DECODER_CB;
 
@@ -113,31 +87,18 @@ bool a2dp_mihc_decoder_init(decoded_data_callback_t decode_callback) {
         }
     }
     tA2DP_MIHC_DECODER_CB *cb = s_mihc_cb;
-    void  *ws  = cb->workspace;      /* keep an already-allocated block across re-init */
-    size_t wss = cb->workspace_size;
     memset(cb, 0, sizeof(*cb));
     cb->decode_callback = decode_callback;
-    /* Workspace is RATE-SIZED, so it is (re)allocated in decoder_configure once
-     * the negotiated sample rate is known. Keep any existing block here. */
-    cb->workspace = ws;
-    cb->workspace_size = wss;
+    MIHC_LOGI("init ENTER cb=%p cbk=%p", (void*)cb, (void*)decode_callback);
     return true;
 }
 
 void a2dp_mihc_decoder_cleanup(void) {
-    /* Release the lazily-allocated IMDCT tables and entropy FAC models since
-     * MIHC is going away — so none of the decoder's scratch lingers in DRAM
-     * while LDAC/SBC is the active codec. */
-    lhdc_imdct_free_960();
-    lhdc_imdct_free_480();
-    lhdc_imdct_free_1920();
-    lhdc_imdct_free_cos();
-    lhdc_dec_free_window();
-    lhdc_entropy_free();
     tA2DP_MIHC_DECODER_CB *cb = s_mihc_cb;
     if (!cb) return;
     if (cb->workspace) {
         heap_caps_free(cb->workspace);
+        cb->workspace = NULL;
     }
     free(cb);
     s_mihc_cb = NULL;
@@ -145,93 +106,59 @@ void a2dp_mihc_decoder_cleanup(void) {
 
 void a2dp_mihc_decoder_configure(const uint8_t* p_codec_info) {
     tA2DP_MIHC_DECODER_CB *cb = s_mihc_cb;
-    if (!cb) return;
+    MIHC_LOGI("configure ENTER cb=%p info=%p", (void*)cb, (const void*)p_codec_info);
+    if (!cb) {
+        MIHC_LOGE("configure: no cb (init not called)");
+        return;
+    }
     tA2DP_MIHC_CIE cie;
     if (A2DP_ParseInfoMihc(&cie, p_codec_info, false) != A2D_SUCCESS) {
         MIHC_LOGE("failed to parse MIHC CIE");
         return;
     }
+    MIHC_LOGI("configure: CIE parsed sr_mask=0x%02x chMode=%d bps=%d ver=0x%02x",
+              cie.sampleRate, cie.channelMode, cie.bitsPerSample, cie.version);
 
-    cb->decoder = NULL;   /* re-init below */
-
-    lhdc_dec_config_t config = {
-        .sample_rate = LHDC_DEC_SR_48000,
-        .bit_depth = LHDC_DEC_BITDEPTH_16,
-        .frame_duration = LHDC_DEC_FRAME_5MS,   /* MIHC shares the 5 ms frame cadence */
-        .channels = 2,
-        .max_frame_bytes = MIHC_FRAGMENT_BUF_SIZE,
-        .lossless_enable = 0,
-    };
-
-    /* MIHC advertises 48 / 44.1 / 32 kHz (see a2dp_mihc_sink_caps). The LHDC
-     * engine picks its band config by samples-per-frame (sr*dur/1000), not by an
-     * enumerated rate, so 32 kHz (160 spf) lands on the same 480-hop HR config
-     * as 44.1/48 kHz — no extra table entry is needed. */
+    /* MIHC BT carrier is 48 kHz / 20 ms / stereo (TOC 0xF4 → LM=2 → N=480).
+     * CIE rate bits are recorded for the app layer; the CELT mode table is 48k. */
     if (cie.sampleRate & A2DP_MIHC_SAMPLING_FREQ_48000) {
-        config.sample_rate = LHDC_DEC_SR_48000;
         a2dp_mihc_current_sample_rate = 48000;
     } else if (cie.sampleRate & A2DP_MIHC_SAMPLING_FREQ_44100) {
-        config.sample_rate = LHDC_DEC_SR_44100;
         a2dp_mihc_current_sample_rate = 44100;
     } else if (cie.sampleRate & A2DP_MIHC_SAMPLING_FREQ_32000) {
-        /* The LHDC engine has no 32 kHz enum; feed it 44100 so lhdc_get_band_cfg()
-         * (which only looks at samples-per-frame) resolves correctly while the
-         * reported rate stays 32000 and drives the downstream ASRC. 32000*5/1000 =
-         * 160 spf, and 44100*5/1000 = 220 spf; both take the <=240 HR branch, so
-         * the band config (and therefore the MDCT geometry) is identical. */
-        config.sample_rate = LHDC_DEC_SR_44100;
         a2dp_mihc_current_sample_rate = 32000;
     } else {
         MIHC_LOGW("MIHC peer offers no rate we implement (cie.sampleRate=0x%02x), using 48k",
                   cie.sampleRate);
-        config.sample_rate = LHDC_DEC_SR_48000;
         a2dp_mihc_current_sample_rate = 48000;
     }
 
     /* Force 16-bit output to match the I2S/PCM pipeline. */
-    config.bit_depth = LHDC_DEC_BITDEPTH_16;
     a2dp_mihc_current_bit_depth = 16;
-    config.channels = 2;
 
-    /* GROW-ONLY workspace, MAX-SIZED for 192k on the FIRST config, then REUSED
-     * for every rate with zero realloc. Grabbing the full block while the heap
-     * is still pristine guarantees the rate switch cannot fail mid-stream (the
-     * heap fragments during a call and a later grow can find no hole). MIHC
-     * itself only negotiates up to 48 kHz, but the LHDC engine's per-rate
-     * carve-out has no smaller "safety" size, so take the same max as LHDC. */
-    {
-        size_t need = lhdc_dec_get_workspace_size(LHDC_DEC_SR_192000, config.frame_duration);
-        if (!cb->workspace || cb->workspace_size < need) {
-            if (cb->workspace) heap_caps_free(cb->workspace);
-            cb->workspace = heap_caps_malloc(need, MIHC_WS_CAPS);
-            if (!cb->workspace) {
-                cb->workspace_size = 0;
-                MIHC_LOGE("configure: cannot allocate %u-byte workspace (largest free %u)",
-                          (unsigned)need,
-                          (unsigned)heap_caps_get_largest_free_block(MIHC_WS_CAPS));
-                return;
-            }
-            cb->workspace_size = need;
-            MIHC_LOGI("configure: workspace %u bytes (max-sized; rate=%u)",
-                      (unsigned)need, (unsigned)a2dp_mihc_current_sample_rate);
+    /* Fragment reassembly block (fixed 3 KB, matches MIHC_FRAGMENT_BUF_SIZE). */
+    if (!cb->workspace) {
+        cb->workspace = heap_caps_malloc(MIHC_FRAGMENT_BUF_SIZE, MIHC_WS_CAPS);
+        if (!cb->workspace) {
+            MIHC_LOGE("configure: cannot allocate %u-byte fragment buf (largest free %u)",
+                      (unsigned)MIHC_FRAGMENT_BUF_SIZE,
+                      (unsigned)heap_caps_get_largest_free_block(MIHC_WS_CAPS));
+            return;
         }
+        cb->workspace_size = MIHC_FRAGMENT_BUF_SIZE;
     }
+    cb->fragment = cb->workspace;
 
-    cb->decoder = lhdc_dec_init(cb->workspace, &config);
+    /* Cross-frame CELT state (OLA / preemph / postfilter) lives in .bss. */
+    mihc_celt_reset();
     cb->fragment_size = 0;
     cb->fragment_count = 0;
 #if MIHC_FRAMEDUMP
-    s_dump_sr = config.sample_rate; s_fd_count = 0;   /* fresh capture per stream */
+    s_dump_sr = a2dp_mihc_current_sample_rate; s_fd_count = 0;  /* fresh capture per stream */
 #endif
 
-    if (!cb->decoder) {
-        MIHC_LOGE("lhdc_dec_init failed for MIHC");
-        return;
-    }
-
-    MIHC_LOGI("decoder configured: sr=%d depth=%d ch=%d dur=%d",
-              (int)a2dp_mihc_current_sample_rate, (int)config.bit_depth,
-              (int)config.channels, (int)config.frame_duration);
+    MIHC_LOGI("decoder configured (MIHC CELT): sr=%d depth=%d ch=2",
+              (int)a2dp_mihc_current_sample_rate, (int)a2dp_mihc_current_bit_depth);
 }
 
 ssize_t a2dp_mihc_decoder_decode_packet_header(BT_HDR* p_buf) {
@@ -279,9 +206,9 @@ bool a2dp_mihc_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf,
                                      size_t buf_len) {
     tA2DP_MIHC_DECODER_CB *cb = s_mihc_cb;
     if (!cb) return false;
-    if (!p_buf || !buf || !cb->decoder || !cb->decode_callback) {
+    if (!p_buf || !buf || !cb->decode_callback) {
         static uint32_t s_e = 0;
-        if ((s_e++ % 200) == 0) MIHC_LOGW("decode_packet null guard (dec=%p)", (void*)cb->decoder);
+        if ((s_e++ % 200) == 0) MIHC_LOGW("decode_packet null guard");
         return false;
     }
     if (buf_len < MIHC_MAX_PCM_BYTES) {
@@ -312,7 +239,7 @@ bool a2dp_mihc_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf,
 #endif
 
     if (cb->fragment_count > 0) {
-        if (src_size > (sizeof(cb->fragment) - (size_t)cb->fragment_size)) {
+        if (src_size > (MIHC_FRAGMENT_BUF_SIZE - (size_t)cb->fragment_size)) {
             cb->fragment_count = 0;
             cb->fragment_size = 0;
             APPL_TRACE_ERROR("%s: fragmented MIHC frame too large", __func__);
@@ -331,106 +258,66 @@ bool a2dp_mihc_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf,
     }
 
     /*
-     * One A2DP payload is a concatenation of frames, each [u16 LE header]
-     * [payload]. Decode them in a loop until the input is exhausted, emitting
-     * each frame's PCM to the sink immediately (no large accumulation buffer —
-     * DRAM on ESP32 is scarce).
-     *
-     * The leading byte before the frame stream is the LHDC seq/marker byte that
-     * is not part of the raw encoder vectors (see a2dp_vendor_lhdcv5_decoder.c
-     * for how it was identified: offset 1 as LE [u16 len] was the unique start
-     * whose descrambled flag bit read 0). MIHC is handled the same way; if the
-     * frame dump shows MIHC does not carry that byte, this offset is the first
-     * thing to change.
+     * BT carrier frame (626 B), from real OTA captures:
+     *   [seq:1][71 02:2][ff fb 5a 20:4][crc8:1][L:BE16=614][TOC+EC:614][crc16:2]
+     * The CELT payload starts at TOC (0xF4) = sync+7 where sync is `ff fb 5a`.
+     * One A2DP payload may pack several frames; step by L+9 from the sync.
      */
-    size_t off = (src_size >= 1) ? 1 : 0;
+    size_t off = 0;
     int frames = 0;
     size_t pcm_emitted = 0;
-    uint8_t out_channels = 2, out_depth = 16;
-    (void)out_channels; (void)out_depth;
 
-    while (off + 2 <= src_size) {
-        /*
-         * MIHC adaptation layer (BES func_01DE1C / func_01DEE8).
-         *
-         * The LHDC engine parses the frame header as
-         *   fhdr = in[0] | (in[1] << 8)   (LE)
-         *   payload_len = (fhdr & 0x3FF) * 2
-         *   flags       = fhdr >> 10
-         * and then DISCARDS `flags` entirely -- LHDC carries its stream params
-         * in the A2DP CIE, not in the frame. The BES MIHC adaptation layer, by
-         * contrast, USES the high bits: its frame-type detector reads three
-         * sub-fields (recovered as [sp+9] / [sp+0xB] / [sp+0xC]) and returns
-         *   3 = normal frame, 9 = sub==1, 0xA = sub==1, 4 = sub==2,
-         *   7 = unknown -> retry / resync.
-         *
-         * We cannot invalidate a frame on `flags` alone: the BES sub-field
-         * mapping onto fhdr bits is not yet pinned down (it needs a real
-         * captured stream to correlate against), and rejecting a frame the
-         * engine would have decoded costs audio. So the flags are decoded and
-         * REPORTED rather than enforced, which is exactly the evidence needed
-         * to finish the mapping. Frame acceptance stays with the engine: a
-         * frame it cannot parse yields LHDC_DEC_BITSTREAM_ERROR below and ends
-         * the loop, which is the same outcome a stricter check would produce.
-         */
-        uint16_t fhdr = (uint16_t)(src[off] | (src[off + 1] << 8));
-        uint16_t flags = (uint16_t)(fhdr >> 10);
-        uint16_t plen  = (uint16_t)((fhdr & 0x03FF) * 2);
+    /* mihc_celt_decode_with_ec only NULL-checks `st`; cross-frame state is
+     * file-scope in mihc_celt_decode.c. Keep a host-sized dummy block. */
+    static uint8_t s_celt_st[4096];
 
-#if MIHC_FRAMEDUMP
-        /* Per-frame header trace, bounded to the same burst as the payload
-         * dump so a captured log stays small. Correlating these flags against
-         * the dumped payload is what pins the frame-type mapping. */
-        {
-            static uint32_t s_hdr_lines = 0;
-            if (s_hdr_lines < 40) {
-                s_hdr_lines++;
-                MIHC_LOGI("MIHC_HDR off=%u fhdr=0x%04x len=%u flags=0x%02x "
-                          "(f2=%u f3=%u f5=%u)",
-                          (unsigned)off, fhdr, plen, flags,
-                          (unsigned)((flags >> 0) & 1),
-                          (unsigned)((flags >> 1) & 1),
-                          (unsigned)((flags >> 3) & 1));
+    while (off + 10 <= src_size) {
+        uint32_t sync_at = 0xFFFFFFFFu;
+        for (size_t i = off; i + 2 < src_size; i++) {
+            if (src[i] == 0xFF && src[i + 1] == 0xFB && src[i + 2] == 0x5A) {
+                sync_at = (uint32_t)i;
+                break;
             }
         }
-#endif
-        if (plen == 0 || off + 2 + plen > src_size) {
-            /* Truncated / not a frame. Report it and let the engine make the
-             * call: it returns LHDC_DEC_NEED_MORE_DATA (frame spans packets) or
-             * LHDC_DEC_BITSTREAM_ERROR, and the loop ends on either. Keeping the
-             * decision in the engine preserves the stock LHDC control flow --
-             * this check only annotates what the header claimed. */
-            static uint32_t s_trunc = 0;
-            if ((s_trunc++ % 20) == 0) {
-                MIHC_LOGW("frame header out of range: off=%u len=%u avail=%u",
-                          (unsigned)off, plen, (unsigned)(src_size - off));
-            }
-        }
-
-        size_t consumed = 0;
-        uint32_t generated = 0;
-        lhdc_dec_frame_info_t info;
-        lhdc_dec_ret_t ret = lhdc_dec_decode_frame(cb->decoder, src + off,
-                                                   src_size - off, buf, 1920,
-                                                   &consumed, &generated, &info);
-        if (ret != LHDC_DEC_OK || consumed == 0) {
-            static uint32_t s_errs = 0;
-            if (frames == 0 && (s_errs++ % 20) == 0) {
-                MIHC_LOGW("decode ret=%d (%s) off=%u/%u (err#%u) hdr=%02x%02x "
-                          "flags=0x%02x",
-                          ret, lhdc_dec_strerror(ret), (unsigned)off,
-                          (unsigned)src_size, s_errs,
-                          src_size >= 2 ? src[off] : 0,
-                          src_size >= 2 ? src[off + 1] : 0, flags);
-            }
+        if (sync_at == 0xFFFFFFFFu) {
+            static uint32_t s_nosync = 0;
+            if ((s_nosync++ % 20) == 0)
+                MIHC_LOGW("no frame sync in %u bytes at off=%u",
+                          (unsigned)(src_size - off), (unsigned)off);
             break;
         }
-        out_channels = info.channels;
-        out_depth = info.bit_depth;
-        size_t pcm_bytes = (size_t)generated * info.channels * (info.bit_depth / 8);
+
+        /* L = payload length at sync+5 (crc8 occupies sync+4). */
+        if (sync_at + 7 > src_size) break;
+        uint32_t plen = ((uint32_t)src[sync_at + 5] << 8) | src[sync_at + 6];
+        if (plen < 2 || plen > 614) {
+            static uint32_t s_badlen = 0;
+            if ((s_badlen++ % 20) == 0)
+                MIHC_LOGW("bad L=%u at sync@%u", (unsigned)plen, (unsigned)sync_at);
+            off = sync_at + 3;
+            continue;
+        }
+        const uint8_t *payload = src + sync_at + 7;   /* TOC 0xF4 */
+        if (sync_at + 7 + plen > src_size) break;
+
+        int16_t *pcm = (int16_t *)buf;
+        int32_t rc = mihc_celt_decode_with_ec((mihc_celt_dec *)s_celt_st,
+                                              payload, (int32_t)plen,
+                                              pcm, 2, NULL, NULL, NULL);
+        if (rc < 0) {
+            static uint32_t s_errs = 0;
+            if (frames == 0 && (s_errs++ % 20) == 0) {
+                MIHC_LOGW("celt decode rc=%d sync@%u plen=%u (err#%u)",
+                          (int)rc, (unsigned)sync_at, (unsigned)plen, s_errs);
+            }
+            off = sync_at + 3;
+            continue;
+        }
+        /* TOC 0xF4 → LM=2 → N=480 samples, stereo int16 interleaved. */
+        size_t pcm_bytes = 480 * 2 * 2;
         cb->decode_callback((uint8_t*)buf, pcm_bytes);
         pcm_emitted += pcm_bytes;
-        off += consumed;
+        off = sync_at + 7 + plen + 2;   /* skip payload + crc16 */
         frames++;
     }
 
@@ -443,9 +330,9 @@ bool a2dp_mihc_decoder_decode_packet(BT_HDR* p_buf, unsigned char* buf,
         static uint32_t s_packets = 0, s_frames = 0, s_pcm = 0;
         s_packets++; s_frames += frames; s_pcm += pcm_emitted;
         if ((s_packets % 100) == 1) {
-            MIHC_LOGI("RX pkt#%u frames=%d pcm=%u (ch=%d depth=%d) totals: %u frames, %u KiB",
+            MIHC_LOGI("RX pkt#%u frames=%d pcm=%u totals: %u frames, %u KiB",
                       s_packets, frames, (unsigned)pcm_emitted,
-                      out_channels, out_depth, s_frames, s_pcm / 1024);
+                      s_frames, s_pcm / 1024);
         }
     }
 #endif

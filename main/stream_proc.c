@@ -30,6 +30,8 @@
 #include "esp_gmf_pool.h"
 #include "esp_gmf_io_bt.h"
 #include "esp_gmf_asrc.h"
+#include "esp_audio_simple_dec_reg.h"
+#include "esp_pcm_dec.h"
 #include "esp_board_manager.h"
 #include "esp_board_manager_defs.h"
 #include "esp_codec_dev.h"
@@ -188,6 +190,11 @@ void stream_proc_set_asrc_dest(esp_gmf_pipeline_handle_t pipe, uint8_t index, ui
     stream_proc_fill_asrc_weight(weight, weight_cap, src_ch, dest_ch);
     esp_asrc_cfg_t *cfg = (esp_asrc_cfg_t *)OBJ_GET_CFG(asrc);
     if (cfg) {
+        /* DEFAULT src_info is 44100. MIHC/LHDC are 48k — if src is left at
+         * 44100 the ASRC resamples wrongly and turns music into white noise. */
+        cfg->src_info.sample_rate = sample_rate;
+        cfg->src_info.channel = src_ch;
+        cfg->src_info.bits_per_sample = 16;
         cfg->weight = weight;
         cfg->weight_len = src_ch * dest_ch;
     }
@@ -531,6 +538,72 @@ static void stream_proc_destroy(stream_user_data_t *user_d)
     }
 }
 
+
+/* GMF simple_dec has no built-in PCM parser (only WAV/M4A/TS/OGG). Vendor
+ * codecs arrive already decoded, and stream_proc asks for TYPE_PCM
+ * pass-through — without this registration AUD_SDEC logs
+ * "Not find default parser for 'PCM '" and forwards garbage (white noise). */
+/* Pure memcpy PCM passthrough. Replaces esp_pcm_dec black-box which was
+ * producing white noise despite musical input (see mihc_diag MUSIC_LIKE
+ * vs speaker output). Frame-aligned: whole buffer is one frame. */
+static esp_audio_err_t pcm_pass_open(void *cfg, uint32_t cfg_sz, void **dec_handle)
+{
+    (void)cfg; (void)cfg_sz;
+    *dec_handle = (void *)1;
+    return ESP_AUDIO_ERR_OK;
+}
+
+static esp_audio_err_t pcm_pass_decode(void *dec_handle,
+                                       esp_audio_dec_in_raw_t *raw,
+                                       esp_audio_dec_out_frame_t *frame,
+                                       esp_audio_dec_info_t *dec_info)
+{
+    (void)dec_handle;
+    if (!raw || !frame || !raw->buffer || raw->len == 0) {
+        return ESP_AUDIO_ERR_INVALID_PARAMETER;
+    }
+    uint32_t n = raw->len;
+    if (n > frame->len) {
+        frame->needed_size = n;
+        return ESP_AUDIO_ERR_BUFF_NOT_ENOUGH;
+    }
+    memcpy(frame->buffer, raw->buffer, n);
+    frame->decoded_size = n;
+    raw->consumed = raw->len;
+    if (dec_info) {
+        dec_info->sample_rate = 48000;
+        dec_info->bits_per_sample = 16;
+        dec_info->channel = 2;
+        dec_info->frame_size = n;
+    }
+    return ESP_AUDIO_ERR_OK;
+}
+
+static esp_audio_err_t pcm_pass_close(void *dec_handle)
+{
+    (void)dec_handle;
+    return ESP_AUDIO_ERR_OK;
+}
+
+void stream_proc_ensure_pcm_simple_dec(void)
+{
+    static bool inited = false;
+    if (inited) return;
+    esp_audio_dec_ops_t ops = {
+        .open = pcm_pass_open,
+        .decode = pcm_pass_decode,
+        .close = pcm_pass_close,
+    };
+    esp_audio_simple_dec_reg_info_t reg = {
+        .decoder_ops = ops,
+        .parser = NULL,   /* whole buffer is one frame */
+        .free = NULL,
+    };
+    esp_audio_err_t err = esp_audio_simple_dec_register(ESP_AUDIO_SIMPLE_DEC_TYPE_PCM, &reg);
+    ESP_LOGI(TAG, "PCM passthrough registered: %d", (int)err);
+    inited = true;
+}
+
 static void stream_proc_prepare(esp_bt_audio_stream_handle_t stream, stream_user_data_t **out)
 {
     stream_user_data_t *user_d = heap_caps_calloc(1, sizeof(stream_user_data_t), MALLOC_CAP_SPIRAM);
@@ -558,6 +631,7 @@ static void stream_proc_prepare(esp_bt_audio_stream_handle_t stream, stream_user
     }
 
     if (dir == ESP_BT_AUDIO_STREAM_DIR_SINK) {
+        stream_proc_ensure_pcm_simple_dec();
         ESP_LOGI(TAG, "Prepare bt to codec pipeline");
         user_d->pipe = bt2codec_pipe;
         esp_gmf_io_bt_set_stream(ESP_GMF_PIPELINE_GET_IN_INSTANCE(user_d->pipe), stream);
@@ -911,6 +985,7 @@ static void setup_stream_proc_task(void)
 
 void stream_proc_init(esp_gmf_pool_handle_t pool)
 {
+    stream_proc_ensure_pcm_simple_dec();
     setup_pipeline_bt2codec(pool);
     setup_pipeline_codec2bt(pool);
     setup_pipeline_local2bt(pool);

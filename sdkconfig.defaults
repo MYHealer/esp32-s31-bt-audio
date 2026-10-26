@@ -4,6 +4,14 @@
 CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
 
 #
+# Console UART baud: 921600 for live MIHC payload uplink (mihc_stream).
+# MUST pair ESP_CONSOLE_UART_CUSTOM=y, otherwise reconfigure treats the
+# baud rate as read-only and resets it to 115200.
+#
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+
+#
 # Serial flasher config
 #
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
@@ -61,4 +69,4 @@ CONFIG_BT_A2DP_AAC_DECODER=y
 # link fails with 5 undefined refs (btc_av_audio_buff_alloc/free,
 # btc_av_is_started, btc_a2d_src_audio_mtu_check, btc_a2d_src_audio_data_send).
 # Revisit once those are implemented, when adding the vendor codecs.
-CONFIG_BT_A2DP_USE_EXTERNAL_CODEC=y
+CONFIG_BT_A2DP_USE_EXTERNAL_CODEC=n

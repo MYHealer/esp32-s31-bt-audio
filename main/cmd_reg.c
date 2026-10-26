@@ -11,6 +11,9 @@
 
 #include "esp_err.h"
 #include "esp_console.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_heap_caps.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_log.h"
@@ -29,6 +32,13 @@
 #include "esp_board_manager_defs.h"
 #include "dev_audio_codec.h"
 #include "cmd_reg.h"
+#include "mihc_ota_payloads.h"
+#include "mihc_one_live.h"
+#include "esp_board_manager.h"
+#include <math.h>
+#include "esp_codec_dev.h"
+#include "dev_audio_codec.h"
+#include "driver/uart.h"
 
 static uint8_t target_device_bda[6] = {0};
 #if CONFIG_BT_CLASSIC_ENABLED && defined(CONFIG_GMF_EXAMPLE_A2DP_SOURCE)
@@ -886,6 +896,424 @@ void cli_register_bt(void)
 #endif  /* CONFIG_GMF_EXAMPLE_AUDIO_TECH_LE */
 }
 
+
+/* --- MIHC serial backdoor: decode quality + heap + stack watermarks --- */
+extern volatile int32_t g_mihc_tap_ready, g_mihc_tap_peak, g_mihc_tap_nz;
+extern volatile int32_t g_mihc_tap_ac1_q15, g_mihc_tap_zcr_q15, g_mihc_tap_frames;
+extern volatile int16_t g_mihc_tap_pcm[32];
+/* DOWNSTREAM tap: bytes actually handed to the GMF/ASRC path */
+extern volatile int32_t g_mihc_emit_chunks, g_mihc_emit_len, g_mihc_emit_ac1_q15;
+extern volatile int32_t g_mihc_emit_zcr_q15, g_mihc_emit_peak, g_mihc_emit_head;
+extern volatile int32_t g_mihc_emit_frame_of[4];
+extern volatile int16_t g_mihc_emit_pcm[4][8];
+
+/* --- DAC-exit tap: last bytes handed to esp_codec_dev_write -> I2S --- */
+extern volatile int32_t g_dac_tap_chunks, g_dac_tap_len, g_dac_tap_ac1_q15;
+extern volatile int32_t g_dac_tap_zcr_q15, g_dac_tap_peak;
+extern volatile int16_t g_dac_tap_pcm[16];
+
+static int cmd_mihc_dacstat(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    int ac1 = (int)g_dac_tap_ac1_q15, zcr = (int)g_dac_tap_zcr_q15;
+    printf("DAC_TAP chunks=%d len=%d peak=%d ac1_q15=%d zcr_q15=%d\n",
+           (int)g_dac_tap_chunks, (int)g_dac_tap_len, (int)g_dac_tap_peak, ac1, zcr);
+    if (g_dac_tap_chunks == 0)            printf("DAC_VERDICT: NO_WRITE\n");
+    else if (g_dac_tap_peak < 32)         printf("DAC_VERDICT: SILENCE\n");
+    else if (ac1 > 20000 && zcr < 8000)   printf("DAC_VERDICT: MUSIC_LIKE\n");
+    else if (ac1 < 4000 && zcr > 12000)   printf("DAC_VERDICT: WHITE_NOISE\n");
+    else                                  printf("DAC_VERDICT: UNCERTAIN\n");
+    printf("DAC_PCM[0..15]:");
+    for (int i = 0; i < 16; i++) printf(" %d", (int)g_dac_tap_pcm[i]);
+    printf("\n");
+    return 0;
+}
+
+/* --- ASRC info tap: upstream (aud_dec) reported info vs ASRC src/dest --- */
+extern volatile int32_t g_asrc_up_rate, g_asrc_up_ch, g_asrc_up_bits;
+extern volatile int32_t g_asrc_src_rate, g_asrc_src_ch, g_asrc_src_bits;
+extern volatile int32_t g_asrc_dst_rate, g_asrc_dst_ch, g_asrc_dst_bits;
+extern volatile int32_t g_asrc_need_reopen, g_asrc_bypass, g_asrc_updates;
+
+static int cmd_mihc_asrcstat(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    printf("ASRC updates=%d\n", (int)g_asrc_updates);
+    printf("ASRC UPSTREAM(aud_dec): rate=%d ch=%d bits=%d\n",
+           (int)g_asrc_up_rate, (int)g_asrc_up_ch, (int)g_asrc_up_bits);
+    printf("ASRC SRC: rate=%d ch=%d bits=%d\n",
+           (int)g_asrc_src_rate, (int)g_asrc_src_ch, (int)g_asrc_src_bits);
+    printf("ASRC DST: rate=%d ch=%d bits=%d\n",
+           (int)g_asrc_dst_rate, (int)g_asrc_dst_ch, (int)g_asrc_dst_bits);
+    printf("ASRC need_reopen=%d bypass=%d\n",
+           (int)g_asrc_need_reopen, (int)g_asrc_bypass);
+    if (g_asrc_updates == 0) {
+        printf("ASRC_VERDICT: NO_UPDATE (no stream info received)\n");
+    } else if (g_asrc_bypass) {
+        printf("ASRC_VERDICT: BYPASS_OK (src==dst, ASRC is transparent)\n");
+    } else {
+        printf("ASRC_VERDICT: ***** ACTIVE_CONVERSION (src!=dst -> ASRC mangles PCM) *****\n");
+    }
+    return 0;
+}
+
+/* --- RAW callback tap: what bt_a2d_sink_raw_data_cb actually received --- */
+extern volatile int32_t g_raw_cb_count, g_raw_len, g_raw_ac1_q15, g_raw_peak;
+extern volatile int16_t g_raw_pcm[16];
+
+static int cmd_mihc_rawstat(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    printf("RAW cb=%d len=%d peak=%d ac1_q15=%d\n",
+           (int)g_raw_cb_count, (int)g_raw_len, (int)g_raw_peak, (int)g_raw_ac1_q15);
+    printf("RAW_PCM[0..15]:");
+    for (int i = 0; i < 16; i++) printf(" %d", (int)g_raw_pcm[i]);
+    printf("\n");
+    printf("  compare vs mihc_diag EMIT_RING[0] (kernel-side, same frame)\n");
+    return 0;
+}
+
+/* --- queue tap: enqueue/drop counters on data_q (bt_a2d_sink_data_cb) --- */
+extern volatile int32_t g_q_drop, g_q_sendfail, g_q_sendtotal, g_q_readyhigh;
+
+static int cmd_mihc_queuestat(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    printf("Q send=%d drop=%d sendfail=%d readyhigh=%d\n",
+           (int)g_q_sendtotal, (int)g_q_drop, (int)g_q_sendfail, (int)g_q_readyhigh);
+    if (g_q_sendtotal == 0) {
+        printf("Q_VERDICT: NO_SEND (data_q never received a packet)\n");
+    } else if (g_q_drop > 0 || g_q_sendfail > 0) {
+        printf("Q_VERDICT: ***** DROPPING (%d drop + %d fail of %d) -> periodic discontinuity *****\n",
+               (int)g_q_drop, (int)g_q_sendfail, (int)g_q_sendtotal);
+    } else {
+        printf("Q_VERDICT: NO_DROP (readyhigh=%d, %d packets all delivered)\n",
+               (int)g_q_readyhigh, (int)g_q_sendtotal);
+    }
+    return 0;
+}
+
+static int cmd_mihc_diag(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    printf("MIHC_DIAG frames=%d ready=%d peak=%d nz=%d ac1_q15=%d zcr_q15=%d\n",
+           (int)g_mihc_tap_frames, (int)g_mihc_tap_ready,
+           (int)g_mihc_tap_peak, (int)g_mihc_tap_nz,
+           (int)g_mihc_tap_ac1_q15, (int)g_mihc_tap_zcr_q15);
+    int ac1 = (int)g_mihc_tap_ac1_q15, zcr = (int)g_mihc_tap_zcr_q15;
+    if (!g_mihc_tap_ready) {
+        printf("VERDICT: NO_DECODE\n");
+    } else if (g_mihc_tap_peak < 32) {
+        printf("VERDICT: SILENCE\n");
+    } else if (ac1 > 20000 && zcr < 8000) {
+        printf("VERDICT: MUSIC_LIKE\n");
+    } else if (ac1 < 4000 && zcr > 12000) {
+        printf("VERDICT: WHITE_NOISE\n");
+    } else {
+        printf("VERDICT: UNCERTAIN\n");
+    }
+    printf("PCM[0..15]:");
+    for (int i = 0; i < 16; i++) {
+        printf(" %d", (int)g_mihc_tap_pcm[i]);
+    }
+    printf("\n");
+    /* DOWNSTREAM tap — must match the kernel tap above if same frame.
+     * If these two disagree in the SAME diag invocation, the corruption is
+     * between decode_packet() and the GMF admission, not in the kernel. */
+    printf("EMIT chunks=%d len=%d ac1_q15=%d zcr_q15=%d peak=%d head=%d\n",
+           (int)g_mihc_emit_chunks, (int)g_mihc_emit_len,
+           (int)g_mihc_emit_ac1_q15, (int)g_mihc_emit_zcr_q15,
+           (int)g_mihc_emit_peak, (int)g_mihc_emit_head);
+    for (int s = 0; s < 4; s++) {
+        int idx = ((g_mihc_emit_head - 1 - s) & 3);
+        printf("EMIT_RING[%d] frame=%d:", s, (int)g_mihc_emit_frame_of[idx]);
+        for (int i = 0; i < 8; i++) printf(" %d", (int)g_mihc_emit_pcm[idx][i]);
+        printf("\n");
+    }
+    printf("heap int=%u psram=%u min_int=%u min_psram=%u\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
+    TaskHandle_t h;
+    const char *names[] = { "A2DP_DECODER", "LVGL", "main", "IDLE0", "IDLE1", NULL };
+    for (int i = 0; names[i]; i++) {
+        h = xTaskGetHandle(names[i]);
+        if (h) {
+            printf("stack_wm %s = %u\n", names[i],
+                   (unsigned)uxTaskGetStackHighWaterMark(h));
+        }
+    }
+    return 0;
+}
+
+
+/* Decode embedded real OTA payloads on-device (no phone needed). */
+extern int32_t mihc_celt_decode_with_ec(void *st, const uint8_t *data, int32_t nb_bytes,
+                                        int16_t *pcm_out, int32_t channels,
+                                        void *r0, void *r1, void *ec);
+extern void mihc_celt_reset(void);
+
+static int cmd_mihc_selfplay(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    static uint8_t st[4096];
+    static int16_t pcm[2 * 480];
+    mihc_celt_reset();
+    int ok = 0;
+    int64_t energy = 0;
+    int peak_all = 0;
+    for (int f = 0; f < MIHC_OTA_NFRAMES; f++) {
+        memset(pcm, 0, sizeof(pcm));
+        int32_t rc = mihc_celt_decode_with_ec(st, mihc_ota_payloads[f], MIHC_OTA_FRAME_LEN,
+                                              pcm, 2, NULL, NULL, NULL);
+        int peak = 0, nz = 0;
+        for (int i = 0; i < 2 * 480; i++) {
+            int v = pcm[i]; if (v < 0) v = -v;
+            if (v > peak) peak = v;
+            if (pcm[i]) nz++;
+            energy += (int64_t)pcm[i] * pcm[i];
+        }
+        if (peak > peak_all) peak_all = peak;
+        printf("selfplay f=%d rc=%d peak=%d nz=%d\n", f, (int)rc, peak, nz);
+        if (nz > 0) ok++;
+    }
+    /* tap-like metrics from last frame */
+    int ac1 = 0, zcr = 0;
+    {
+        int64_t a = 0, n = 0; int16_t prev = 0; int zc = 0;
+        for (int i = 0; i < 480; i++) {
+            int16_t v = pcm[2 * i];
+            a += (int32_t)prev * v; n += (int32_t)prev * prev;
+            if ((prev < 0) != (v < 0)) zc++;
+            prev = v;
+        }
+        ac1 = n ? (int)((a << 15) / n) : 0;
+        zcr = (int)((zc << 15) / 480);
+    }
+    printf("DEV16:");
+    for (int i = 0; i < 16; i++) printf(" %d", pcm[i]);
+    printf("\n");
+    printf("selfplay SUMMARY ok=%d/%d energy=%lld peak=%d ac1_q15=%d zcr_q15=%d\n",
+           ok, MIHC_OTA_NFRAMES, (long long)energy, peak_all, ac1, zcr);
+    if (ok == 0) {
+        printf("SELFPLAY_VERDICT: DECODE_FAIL\n");
+    } else if (peak_all < 32) {
+        printf("SELFPLAY_VERDICT: SILENCE\n");
+    } else if (ac1 > 20000 && zcr < 8000) {
+        printf("SELFPLAY_VERDICT: MUSIC_LIKE\n");
+    } else if (ac1 < 4000 && zcr > 12000) {
+        printf("SELFPLAY_VERDICT: WHITE_NOISE\n");
+    } else {
+        printf("SELFPLAY_VERDICT: UNCERTAIN\n");
+    }
+    return 0;
+}
+
+
+/* Write decoded PCM straight to DAC, bypassing GMF. If this sounds like
+ * music, GMF is the noise source. If still white noise, I2S/DAC is. */
+static int cmd_mihc_dac(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    extern int32_t mihc_celt_decode_with_ec(void *st, const uint8_t *data, int32_t nb_bytes,
+                                            int16_t *pcm_out, int32_t channels,
+                                            void *r0, void *r1, void *ec);
+    extern void mihc_celt_reset(void);
+    dev_audio_codec_handles_t *h = NULL;
+    if (esp_board_manager_get_device_handle(ESP_BOARD_DEVICE_NAME_AUDIO_DAC, (void **)&h) != ESP_OK || !h) {
+        printf("no DAC handle\n");
+        return 1;
+    }
+    esp_codec_dev_sample_info_t fs = {
+        .sample_rate = 48000, .bits_per_sample = 16, .channel = 2,
+        .mclk_multiple = 256, .channel_mask = 0x03,
+    };
+    /* PA (GPIO47, active HIGH) is only enabled by A2DP stream start.
+     * Direct DAC writes need it forced on or there is NO sound. */
+    {
+        extern esp_err_t gpio_config(void *);
+        extern esp_err_t gpio_set_level(int, int);
+        typedef struct { unsigned long pin_bit_mask; int mode; int pull_up_en; int pull_down_en; int intr_type; } fake_gpio_cfg_t;
+        fake_gpio_cfg_t cfg = { .pin_bit_mask = 1UL << 47, .mode = 3, .pull_up_en = 0, .pull_down_en = 0, .intr_type = 0 };
+        gpio_config(&cfg);
+        gpio_set_level(47, 1);
+        printf("PA ON gpio47\n");
+    }
+    int err = esp_codec_dev_open(h->codec_dev, &fs);
+    printf("dac open %d\n", err);
+    static uint8_t st[4096];
+    static int16_t pcm[2 * 480];
+    mihc_celt_reset();
+    /* 5 loops of embedded frames = ~0.4s music */
+    for (int loop = 0; loop < 20; loop++) {
+        for (int f = 0; f < MIHC_OTA_NFRAMES; f++) {
+            memset(pcm, 0, sizeof(pcm));
+            mihc_celt_decode_with_ec(st, mihc_ota_payloads[f], MIHC_OTA_FRAME_LEN,
+                                     pcm, 2, NULL, NULL, NULL);
+            int w = esp_codec_dev_write(h->codec_dev, pcm, (int)sizeof(pcm));
+            if (w != 0) { printf("write err %d\n", w); break; }
+        }
+    }
+    printf("MIHC_DAC_DONE\n");
+    return 0;
+}
+
+/* Print last N live OTA payloads (ring buffer) as hex for host replay. */
+extern volatile int32_t g_mihc_dump_ready, g_mihc_dump_nf, g_mihc_dump_len[];
+extern volatile uint8_t g_mihc_dump_pay[][620];
+extern volatile int32_t g_mihc_dump_seq[], g_mihc_dump_head, g_mihc_dump_count;
+
+static int cmd_mihc_dump(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    int nf = g_mihc_dump_nf;
+    int head = g_mihc_dump_head;
+    printf("DUMP nf=%d head=%d total=%d\n", nf, head, (int)g_mihc_dump_count);
+    if (nf <= 0) {
+        printf("NO_FRAMES\n");
+        return 0;
+    }
+    int start = head - nf;
+    if (start < 0) start += 8;
+    for (int i = 0; i < nf; i++) {
+        int idx = (start + i) % 8;
+        int n = (int)g_mihc_dump_len[idx];
+        printf("PAYLOAD %d len=%d ", i, n);
+        for (int j = 0; j < n && j < 620; j++) printf("%02x", g_mihc_dump_pay[idx][j]);
+        printf("\n");
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* mihc_stream : continuously push NEW payloads (TOC+EC) to UART0 TX.  */
+/*  Frame wire format (binary, no ASCII):                              */
+/*     [0xA5][seq:2 LE][plen:2 LE][payload ...]                        */
+/*  seq = g_mihc_dump_seq (monotonic per decoded frame). PC joins      */
+/*  consecutive seq to rebuild the live stream; gaps => drop detected. */
+/*  Runs resident in the REPL task with a generous time budget; Ctrl-C  */
+/*  (or the iteration cap) ends it.                                    */
+/* ------------------------------------------------------------------ */
+#define MIHC_STREAM_RING 8      /* mirrors MIHC_DUMP_NF in the decoder */
+#define MIHC_STREAM_MAX_ITER 6000    /* ~120 s at 20 ms/iter */
+#define MIHC_STREAM_PERIOD_MS 20
+
+static int cmd_mihc_stream(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    /* Copy-once per frame: snapshot the slot BEFORE writing, so the payload
+     * bytes we send belong to one seq slot even if the decoder overwrites
+     * the slot mid-send (detected by PC as a seq gap, not a corrupt blob). */
+    static uint8_t slot[620];
+    int32_t last = g_mihc_dump_count;            /* only NEW frames */
+    int64_t sent_frames = 0, sent_bytes = 0;
+    printf("STREAM start last=%d (921600 baud)\n", (int)last);
+
+    for (int iter = 0; iter < MIHC_STREAM_MAX_ITER; iter++) {
+        int32_t now = g_mihc_dump_count;
+        while (last < now) {
+            uint8_t hdr[5];
+            int32_t seq = last;
+            int32_t idx = seq % MIHC_STREAM_RING;
+            if (idx >= 0 && idx < MIHC_STREAM_RING) {
+                int32_t n = g_mihc_dump_len[idx];
+                if (n > 0 && n <= 620) {
+                    memcpy(slot, g_mihc_dump_pay[idx], (size_t)n);
+                    hdr[0] = 0xA5;
+                    hdr[1] = (uint8_t)(seq & 0xFF);
+                    hdr[2] = (uint8_t)((seq >> 8) & 0xFF);
+                    hdr[3] = (uint8_t)(n & 0xFF);
+                    hdr[4] = (uint8_t)((n >> 8) & 0xFF);
+                    uart_write_bytes(UART_NUM_0, hdr, sizeof(hdr));
+                    uart_write_bytes(UART_NUM_0, slot, (size_t)n);
+                    sent_frames++;
+                    sent_bytes += n;
+                }
+            }
+            last = now;
+        }
+        if ((sent_frames % 500) == 0 && sent_frames > 0) {
+            printf("\nSTREAM n=%d f=%lld B=%lld\n",
+                   (int)now, (long long)sent_frames, (long long)sent_bytes);
+        }
+        vTaskDelay(pdMS_TO_TICKS(MIHC_STREAM_PERIOD_MS));
+    }
+    printf("\nSTREAM_END frames=%lld bytes=%lld\n",
+           (long long)sent_frames, (long long)sent_bytes);
+    return 0;
+}
+
+static int cmd_mihc_sine(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    dev_audio_codec_handles_t *h = NULL;
+    if (esp_board_manager_get_device_handle(ESP_BOARD_DEVICE_NAME_AUDIO_DAC, (void **)&h) != ESP_OK || !h) {
+        printf("no DAC\n");
+        return 1;
+    }
+    esp_codec_dev_sample_info_t fs = {
+        .sample_rate = 48000, .bits_per_sample = 16, .channel = 2,
+        .mclk_multiple = 256, .channel_mask = 0x03,
+    };
+    /* PA (GPIO47, active HIGH) is only enabled by A2DP stream start.
+     * Direct DAC writes need it forced on or there is NO sound. */
+    {
+        extern esp_err_t gpio_config(void *);
+        extern esp_err_t gpio_set_level(int, int);
+        typedef struct { unsigned long pin_bit_mask; int mode; int pull_up_en; int pull_down_en; int intr_type; } fake_gpio_cfg_t;
+        fake_gpio_cfg_t cfg = { .pin_bit_mask = 1UL << 47, .mode = 3, .pull_up_en = 0, .pull_down_en = 0, .intr_type = 0 };
+        gpio_config(&cfg);
+        gpio_set_level(47, 1);
+        printf("PA ON gpio47\n");
+    }
+    printf("sine open %d\n", esp_codec_dev_open(h->codec_dev, &fs));
+    static int16_t pcm[2 * 480];
+    float ph = 0.0f;
+    for (int beep = 0; beep < 3; beep++) {
+        printf(">>> BEEP %d/3\n", beep + 1);
+        for (int blk = 0; blk < 50; blk++) {
+            for (int i = 0; i < 480; i++) {
+                int16_t s = (int16_t)(sinf(ph) * 12000.0f);
+                pcm[2 * i] = s; pcm[2 * i + 1] = s;
+                ph += 2.0f * 3.1415926f * 1000.0f / 48000.0f;
+                if (ph > 6.2831853f) ph -= 6.2831853f;
+            }
+            esp_codec_dev_write(h->codec_dev, pcm, (int)sizeof(pcm));
+        }
+        printf("<<< BEEP %d/3 silence\n", beep + 1);
+        memset(pcm, 0, sizeof(pcm));
+        for (int blk = 0; blk < 50; blk++) esp_codec_dev_write(h->codec_dev, pcm, (int)sizeof(pcm));
+    }
+    printf("SINE_TEST_DONE\n");
+    return 0;
+}
+
+static int cmd_mihc_one(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    static uint8_t st[4096];
+    static int16_t pcm[2 * 480];
+    mihc_celt_reset();
+    memset(pcm, 0, sizeof(pcm));
+    int32_t rc = mihc_celt_decode_with_ec(st, mihc_one_live, MIHC_ONE_LIVE_LEN,
+                                          pcm, 2, NULL, NULL, NULL);
+    printf("ONE rc=%d len=%d\n", (int)rc, MIHC_ONE_LIVE_LEN);
+    printf("DEV16:");
+    for (int i = 0; i < 16; i++) printf(" %d", pcm[i]);
+    printf("\n");
+    int64_t a = 0, n = 0; int16_t prev = 0;
+    for (int i = 0; i < 480; i++) {
+        int16_t v = pcm[2 * i];
+        a += (int32_t)prev * v;
+        n += (int32_t)prev * prev;
+        prev = v;
+    }
+    printf("ONE_SUMMARY ac1_q15=%d peak_check=%d\n",
+           n ? (int)((a << 15) / n) : 0, pcm[0]);
+    return 0;
+}
+
 static int restart(int argc, char **argv)
 {
     printf("Restarting\n");
@@ -971,10 +1399,76 @@ void cli_register_sys()
             .func = &tasks_info,
         },
         {
+            .command = "mihc_diag",
+            .help = "MIHC decode quality + heap + stack watermarks",
+            .hint = NULL,
+            .func = &cmd_mihc_diag,
+        },
+        {
+            .command = "mihc_dacstat",
+            .help = "DAC-exit tap: PCM actually written to I2S (post-GMF/ASRC)",
+            .hint = NULL,
+            .func = &cmd_mihc_dacstat,
+        },
+        {
+            .command = "mihc_asrcstat",
+            .help = "ASRC tap: upstream info vs ASRC src/dest, bypass verdict",
+            .hint = NULL,
+            .func = &cmd_mihc_asrcstat,
+        },
+        {
+            .command = "mihc_rawstat",
+            .help = "RAW cb tap: last buffer received by bt_a2d_sink_raw_data_cb",
+            .hint = NULL,
+            .func = &cmd_mihc_rawstat,
+        },
+        {
+            .command = "mihc_queuestat",
+            .help = "Queue tap: data_q send/drop counters (detects packet drops)",
+            .hint = NULL,
+            .func = &cmd_mihc_queuestat,
+        },
+        {
+            .command = "mihc_selfplay",
+            .help = "Decode embedded OTA payloads on-device (no phone)",
+            .hint = NULL,
+            .func = &cmd_mihc_selfplay,
+        },
+        {
+            .command = "mihc_dac",
+            .help = "Play decoded PCM straight to DAC (bypass GMF)",
+            .hint = NULL,
+            .func = &cmd_mihc_dac,
+        },
+        {
+            .command = "mihc_one",
+            .help = "Decode one real live payload, print first 16 samples",
+            .hint = NULL,
+            .func = &cmd_mihc_one,
+        },
+        {
+            .command = "mihc_dump",
+            .help = "Print captured live OTA payloads as hex",
+            .hint = NULL,
+            .func = &cmd_mihc_dump,
+        },
+        {
+            .command = "mihc_sine",
+            .help = "Play 1kHz sine straight to DAC (control test)",
+            .hint = NULL,
+            .func = &cmd_mihc_sine,
+        },
+        {
             .command = "log_level",
             .help = "Set runtime log level for a tag or *",
             .hint = "<tag|*> <level>",
             .func = &log_level,
+        },
+        {
+            .command = "mihc_stream",
+            .help = "Stream new live OTA payloads to UART0 as binary FEC frames",
+            .hint = NULL,
+            .func = &cmd_mihc_stream,
         }};
 
     for (int i = 0; i < sizeof(cmds) / sizeof(esp_console_cmd_t); i++) {
@@ -987,6 +1481,9 @@ void cli_init()
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     repl_config.prompt = "BTAudio >";
+    /* mihc_one / mihc_selfplay call into mihc_celt_decode_with_ec, whose local
+     * buffers (freq_buf 7.5KB + X + band tables) blow the 4KB default REPL stack. */
+    repl_config.task_stack_size = 32768;
 #if CONFIG_ESP_CONSOLE_UART
     esp_console_dev_uart_config_t uart_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&uart_config, &repl_config, &repl));

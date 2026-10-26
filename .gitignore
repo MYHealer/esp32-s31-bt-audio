@@ -1,6 +1,9 @@
 build/
+build_le/
+build_ps1/
 sdkconfig
 sdkconfig.old
+sdkconfig.bak.*
 managed_components/
 dependencies.lock
 components/gen_bmgr_codes/
@@ -11,3 +14,40 @@ components/gen_bmgr_codes/
 参考项目/
 *.log
 capture_err.txt
+
+# ---- 调试/临时产物 ----
+_work/
+_dead_copies_backup/
+ref_prj/
+*.pyc
+__pycache__/
+*.o
+*.exe
+*.zip
+*.pcm
+*.opus
+*.so
+*.dll
+*.json.tmp
+
+# ---- 串口/监控/烧录脚本 ----
+*.ps1
+capture_*.py
+cap*.py
+probe_*.py
+_*.py
+t[0-9]*.py
+mon*.py
+serial*.py
+.bak
+*.bak
+*.bak.*
+*.txt
+*.bat
+*.out
+sdkconfig.defaults.*
+
+# ---- 构建副本: 勿提交 ----
+components/esp_bt_audio/src/mlac_*
+
+!**/README*.md

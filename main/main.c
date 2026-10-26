@@ -625,14 +625,15 @@ static void playback_status_chg_proc(esp_bt_audio_event_playback_st_t *event_dat
             break;
         case ESP_BT_AUDIO_PLAYBACK_EVENT_TRACK_CHANGE:
             ESP_LOGI(TAG, "Track changed, requesting metadata");
+            /* Cover art is not a product feature here (other codecs show none either).
+             * Requesting it opens AVRCP BIP and stalls the BT thread. Title/artist only. */
             esp_bt_audio_playback_request_metadata(ESP_BT_AUDIO_PLAYBACK_METADATA_TITLE |
                                                    ESP_BT_AUDIO_PLAYBACK_METADATA_ARTIST |
                                                    ESP_BT_AUDIO_PLAYBACK_METADATA_ALBUM |
-                                                   ESP_BT_AUDIO_PLAYBACK_METADATA_GENRE |
-                                                   ESP_BT_AUDIO_PLAYBACK_METADATA_COVER_ART);
+                                                   ESP_BT_AUDIO_PLAYBACK_METADATA_GENRE);
             break;
         case ESP_BT_AUDIO_PLAYBACK_EVENT_PLAY_POS_CHANGED:
-            ESP_LOGI(TAG, "Playback position changed: %d", event_data->evt_param.position);
+            /* position spam off */
             break;
         default:
             ESP_LOGW(TAG, "Playback event %02X", event_data->event);
@@ -1030,18 +1031,21 @@ void app_main()
     ui = bt_ui_create(device_name, &ui_cfg);
 #endif  /* CONFIG_EXAMPLE_BT_UI_ENABLE */
 
-    /* Mount the SD card last and without ESP_ERROR_CHECK. The board manager
-     * deliberately skips fs_sdcard during auto-init (init_skip in
-     * board_devices.yaml) because an absent or unresponsive card makes the
-     * SDMMC probe wait forever, which parks the startup path and trips the task
-     * watchdog. Neither the UI nor the audio path needs /sdcard, so a failure
-     * here is logged and ignored. */
-    esp_err_t sd_ret = esp_board_manager_init_device_by_name(ESP_BOARD_DEVICE_NAME_FS_SDCARD);
-    if (sd_ret == ESP_OK) {
-        ESP_LOGI(TAG, "SD card mounted at /sdcard");
-    } else {
-        ESP_LOGW(TAG, "SD card not available (%s), continuing without it", esp_err_to_name(sd_ret));
-    }
+    /* SD card mount is DISABLED on purpose — this was the boot hang.
+     *
+     * The board manager marks fs_sdcard with init_skip:true (board_devices.yaml)
+     * precisely because the SDMMC probe waits forever when the card is absent
+     * or unresponsive. Calling init_device_by_name() here overrode that
+     * protection and parked the boot path inside the probe: the serial log stops
+     * right after "Device sdcard_power_ctrl config found", so
+     * esp_bt_controller_init()/esp_bt_audio_init() below never run and the
+     * device ends up with a dead Bluetooth front end (no audio at all, no AVRCP
+     * metadata) while still looking "booted" on the LCD.
+     *
+     * Nothing in the UI or the audio path needs /sdcard, so skip it and keep the
+     * boot path alive. To re-enable, restore the init_device_by_name() call
+     * below once the SDMMC hang itself is fixed. */
+    ESP_LOGW(TAG, "SD card mount skipped (avoids SDMMC probe hang on boot)");
 
 #if CONFIG_BT_ENABLED
 #ifdef CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY

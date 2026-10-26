@@ -484,7 +484,7 @@ static void avrcp_ct_handle_cover_art_state(esp_avrc_cover_art_conn_state_t stat
             avrcp_ct->cover_art.image_size = 0;
         }
         if (avrcp_ct->remote_feature_mask & ESP_AVRC_FEAT_FLAG_TG_COVER_ART) {
-            esp_err_t ret = esp_avrc_ct_cover_art_connect(COVER_ART_MTU_MAX);
+            esp_err_t ret = ESP_ERR_NOT_SUPPORTED; /* cover art off: not a product feature */
             if (ret != ESP_OK) {
                 ESP_LOGW(TAG, "CT cover art reconnect failed: %s", esp_err_to_name(ret));
             }
@@ -651,7 +651,7 @@ static void bt_app_rc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t
 #if CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
             if (rc->rmt_feats.tg_feat_flag & ESP_AVRC_FEAT_FLAG_TG_COVER_ART) {
                 ESP_LOGI(TAG, "CT remote supports Cover Art, start cover art connection");
-                esp_err_t ret = esp_avrc_ct_cover_art_connect(COVER_ART_MTU_MAX);
+                esp_err_t ret = ESP_ERR_NOT_SUPPORTED; /* cover art off: not a product feature */
                 if (ret != ESP_OK) {
                     ESP_LOGW(TAG, "CT cover art connect failed: %s", esp_err_to_name(ret));
                 }
